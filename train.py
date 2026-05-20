@@ -209,10 +209,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sid_mode', type=str, default='none',
                         choices=['none', 'fid_order'],
                         help='r6: DIG-style coarse-to-fine feature injection mode. '
-                             'none = original behavior (all fids concat -> one token). '
-                             'fid_order = each fid has its own Linear(emb_dim->D); '
-                             'block k sees prefix-sum of first k_fids fid projections, '
-                             'where k_fids grows linearly across blocks.')
+                             'none = original behavior (full feature set every step). '
+                             'fid_order = DIG training: each training step runs '
+                             '--dig_steps forward passes with reveal_ratio=1/K,...,1. '
+                             'Fids are sorted by vocab_size (coarse→fine) and only the '
+                             'first ceil(N*ratio) are active per pass; K losses averaged. '
+                             'Covers user_int, item_int, user_dense, and all seq domains. '
+                             'Inference always uses full feature set (reveal_ratio=1.0).')
+    parser.add_argument('--dig_steps', type=int, default=4,
+                        help='r6: Number of forward passes per training step when '
+                             '--sid_mode=fid_order (DIG coarse-to-fine training). '
+                             'Ignored when --sid_mode=none. '
+                             'Larger values = stronger regularisation but higher compute. '
+                             'Typical value: 4.')
 
     args = parser.parse_args()
 
@@ -324,6 +333,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "csa_top_k": args.csa_top_k,
         "sid_mode": args.sid_mode,
+        "dig_steps": args.dig_steps,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

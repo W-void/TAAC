@@ -1218,11 +1218,20 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        fid_mask: Optional[List[bool]] = None,
+    ) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            fid_mask: Optional list of length len(feature_specs).  When
+                provided (fid_order mode), fid_mask[i]=False means the i-th
+                fid is masked out and replaced with a zero vector, so that
+                the model learns to predict from partial feature sets.
+                None = no masking (original behaviour).
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1233,9 +1242,12 @@ class GroupNSTokenizer(nn.Module):
             for fid_idx in group:
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
+                # Masked-out fid → zero float vector (same shape as a real embedding)
+                if fid_mask is not None and not fid_mask[fid_idx]:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
+                elif emb_real_idx == -1:
                     # Filtered high-cardinality feature: output zero vector
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -1350,11 +1362,20 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        fid_mask: Optional[List[bool]] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            fid_mask: Optional list of length len(feature_specs).  When
+                provided (fid_order mode), fid_mask[i]=False means the i-th
+                fid slot is replaced with a zero vector in the concatenated
+                embedding, so that downstream chunks learn from partial inputs.
+                None = no masking (original behaviour).
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1365,8 +1386,11 @@ class RankMixerNSTokenizer(nn.Module):
             for fid_idx in group:
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                # Masked-out fid → zero float vector
+                if fid_mask is not None and not fid_mask[fid_idx]:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
+                elif emb_real_idx == -1:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -1443,12 +1467,21 @@ class PCVRHyFormer(nn.Module):
         # r2: CSA top-k — 0 = disabled; >0 = keep only top-csa_top_k seq tokens
         # per Cross-Attention query (by dot-product relevance)
         csa_top_k: int = 0,
-        # r6: DIG-style sequential feature injection mode
-        # 'none'       = original behavior (all fids concat → one Linear → one token)
-        # 'fid_order'  = each fid has its own Linear(emb_dim→D); Block k sees
-        #                the prefix-sum of the first k_fids(k) fid projections,
-        #                where k_fids grows linearly across blocks (coarse→fine).
+        # r6: DIG-style coarse-to-fine feature injection mode
+        # 'none'       = original behavior (all fids used for every forward pass)
+        # 'fid_order'  = DIG training: each training step runs dig_steps forward
+        #                passes with reveal_ratio = 1/K, 2/K, …, 1.  Fids are
+        #                sorted by vocab_size (ascending = coarse→fine) and only
+        #                the first ceil(N*ratio) fids are active per pass; the
+        #                rest are zeroed out.  All K losses are averaged.
+        #                Covers ALL feature groups: user_int, item_int,
+        #                user_dense (treated as one atomic fid), and every seq
+        #                domain. Inference always uses reveal_ratio=1.0 (identical
+        #                to 'none' in terms of final token values).
         sid_mode: str = 'none',
+        # Number of forward passes per training step in fid_order mode.
+        # Ignored when sid_mode='none'.
+        dig_steps: int = 4,
     ) -> None:
         super().__init__()
 
@@ -1468,6 +1501,7 @@ class PCVRHyFormer(nn.Module):
         assert sid_mode in ('none', 'fid_order'), \
             f"sid_mode must be 'none' or 'fid_order', got {sid_mode!r}"
         self.sid_mode = sid_mode
+        self.dig_steps = max(1, int(dig_steps))
 
         # ================== NS Tokens Construction ==================
 
@@ -1529,6 +1563,55 @@ class PCVRHyFormer(nn.Module):
             num_item_ns = item_ns_tokens
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
+
+        # ================== r6: fid_order reveal ordering ==================
+        # For each feature group, compute the order in which fids should be
+        # revealed during DIG-style training (coarse = low vocab_size → fine =
+        # high vocab_size).  We store integer indices (sorted positions) so that
+        # _build_fid_mask() can construct the correct mask for any reveal_ratio.
+        #
+        # user_int / item_int:
+        #   _user_fid_reveal_order[i] = the fid_idx that should be revealed at
+        #   position i (0 = first = lowest vocab_size).
+        #
+        # user_dense / item_dense:
+        #   Treated as a single "atomic" fid — always revealed together.
+        #   We represent this with a 1-element list.
+        #
+        # seq domains:
+        #   _seq_fid_reveal_order[domain][i] = the fid position in seq data
+        #   that should be revealed at reveal step i.
+        if sid_mode == 'fid_order':
+            # NS: sort fids by vocab_size ascending (coarse→fine)
+            self._user_fid_reveal_order: List[int] = sorted(
+                range(len(user_int_feature_specs)),
+                key=lambda i: user_int_feature_specs[i][0]
+            )
+            self._item_fid_reveal_order: List[int] = sorted(
+                range(len(item_int_feature_specs)),
+                key=lambda i: item_int_feature_specs[i][0]
+            )
+            # Seq: sort each domain's fids by vocab_size ascending
+            self._seq_fid_reveal_order: dict = {}
+            for domain in self.seq_domains:
+                vs_list = seq_vocab_sizes[domain]
+                self._seq_fid_reveal_order[domain] = sorted(
+                    range(len(vs_list)), key=lambda i: vs_list[i]
+                )
+            logging.info(
+                f"[r6 fid_order] user_int reveal order (by vocab_size): "
+                f"{self._user_fid_reveal_order[:8]}... "
+                f"({len(self._user_fid_reveal_order)} fids)"
+            )
+            logging.info(
+                f"[r6 fid_order] item_int reveal order (by vocab_size): "
+                f"{self._item_fid_reveal_order[:8]}... "
+                f"({len(self._item_fid_reveal_order)} fids)"
+            )
+        else:
+            self._user_fid_reveal_order = []
+            self._item_fid_reveal_order = []
+            self._seq_fid_reveal_order = {}
 
         # Dense feature dropout – applied to raw dense vectors before projection
         # to prevent model from memorizing dense feature scale patterns
@@ -1602,9 +1685,6 @@ class PCVRHyFormer(nn.Module):
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
 
-        # {domain: ModuleList of per-fid Linear(emb_dim→D)} — only used in fid_order mode
-        self._seq_fid_projs = nn.ModuleDict()
-
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
             embs, idx_map, is_id = _make_seq_embs(vs)
@@ -1612,20 +1692,15 @@ class PCVRHyFormer(nn.Module):
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
             self._seq_vocab_sizes[domain] = vs
-            if sid_mode == 'fid_order':
-                # Each fid gets its own Linear(emb_dim → d_model) + shared LN
-                # The proj input is always emb_dim regardless of fid count,
-                # so downstream blocks see a fixed-dim token after prefix-sum.
-                self._seq_fid_projs[domain] = nn.ModuleList([
-                    nn.Linear(emb_dim, d_model) for _ in range(len(vs))
-                ])
-                # Shared LayerNorm applied to the accumulated token
-                self._seq_proj[domain] = nn.LayerNorm(d_model)
-            else:
-                self._seq_proj[domain] = nn.Sequential(
-                    nn.Linear(len(vs) * emb_dim, d_model),
-                    nn.LayerNorm(d_model),
-                )
+            # Always use concat→Linear→LN projection.
+            # In fid_order mode, fids are selectively zeroed-out before concat
+            # (via reveal_k in _embed_seq_domain), so no separate per-fid
+            # projections are needed.  The same Linear handles all granularity
+            # levels, which is exactly the parameter-sharing property DIG requires.
+            self._seq_proj[domain] = nn.Sequential(
+                nn.Linear(len(vs) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1868,27 +1943,43 @@ class PCVRHyFormer(nn.Module):
         seq_diff_hour_ids: Optional[torch.Tensor] = None,
         seq_diff_day_ids: Optional[torch.Tensor] = None,
         seq_diff_week_ids: Optional[torch.Tensor] = None,
-        fid_projs: Optional[nn.ModuleList] = None,
-    ):
-        """Embeds a sequence domain.
+        reveal_order: Optional[List[int]] = None,
+        reveal_k: int = -1,
+    ) -> torch.Tensor:
+        """Embeds a sequence domain into a single (B, L, D) token.
 
-        sid_mode='none' (fid_projs is None):
-            Returns a single (B, L, D) tensor — original behaviour.
+        Args:
+            seq: (B, S, L) integer feature tensor (S fids, L seq len).
+            sideinfo_embs: per-fid embedding tables.
+            proj: Linear+LN projection (S*emb_dim -> D).
+            is_id: per-fid high-cardinality flag.
+            emb_index: fid index → embedding table index (-1 = skipped).
+            time_bucket_ids: (B, L) time bucket indices.
+            seq_hour_ids … seq_diff_week_ids: optional temporal features.
+            reveal_order: optional list of fid indices in coarse→fine order.
+                When provided together with reveal_k, only fids whose position
+                in reveal_order is < reveal_k are active; the rest are zeroed.
+                reveal_order=None means no masking (full feature set).
+            reveal_k: number of fids to reveal (active).  -1 or >= S → all.
 
-        sid_mode='fid_order' (fid_projs is not None):
-            Returns a list of S tensors, each (B, L, D).
-            Each tensor is the projection of one fid's embedding via its own
-            Linear(emb_dim -> D).  Temporal embeddings are returned separately
-            as a (B, L, D) tensor (second return value) so that _build_seq_tokens
-            can add them to any prefix-sum at the right layer.
-            Return type: Tuple[List[Tensor], Tensor]  where the second element
-            is the combined temporal delta to add to each layer's token.
+        Returns:
+            (B, L, D) sequence token tensor.
         """
         B, S, L = seq.shape
+
+        # Build active-fid set for DIG-style masking
+        if reveal_order is not None and 0 <= reveal_k < S:
+            active_fids: Optional[set] = set(reveal_order[:reveal_k])
+        else:
+            active_fids = None  # all fids active
+
         emb_list = []
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
-            if real_idx == -1:
+            # Masked-out fid (DIG partial reveal): zero vector
+            if active_fids is not None and i not in active_fids:
+                emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
+            elif real_idx == -1:
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
@@ -1897,37 +1988,7 @@ class PCVRHyFormer(nn.Module):
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
 
-        # ---- fid_order mode: return per-fid projected tensors ----
-        if fid_projs is not None:
-            # Project each fid embedding independently: (B, L, emb_dim) -> (B, L, D)
-            fid_token_list = []
-            for i, (raw_emb, fid_linear) in enumerate(zip(emb_list, fid_projs)):
-                fid_token_list.append(F.gelu(fid_linear(raw_emb)))  # (B, L, D)
-
-            # Build temporal delta (same shape D, added once to the final token level)
-            time_delta = seq.new_zeros(B, L, self.d_model, dtype=torch.float)
-            if self.num_time_buckets > 0:
-                time_delta = time_delta + self.time_embedding(time_bucket_ids)
-            if self.use_temporal_features:
-                if seq_hour_ids is not None:
-                    h_emb = self.seq_hour_emb(seq_hour_ids)
-                    if self.training:
-                        h_emb = self.abs_time_dropout(h_emb)
-                    time_delta = time_delta + h_emb
-                if seq_weekday_ids is not None:
-                    w_emb = self.seq_weekday_emb(seq_weekday_ids)
-                    if self.training:
-                        w_emb = self.abs_time_dropout(w_emb)
-                    time_delta = time_delta + w_emb
-                if seq_diff_hour_ids is not None:
-                    time_delta = time_delta + self.seq_diff_hour_emb(seq_diff_hour_ids)
-                if seq_diff_day_ids is not None:
-                    time_delta = time_delta + self.seq_diff_day_emb(seq_diff_day_ids)
-                if seq_diff_week_ids is not None:
-                    time_delta = time_delta + self.seq_diff_week_emb(seq_diff_week_ids)
-            return fid_token_list, time_delta
-
-        # ---- original mode (sid_mode='none'): concat -> Linear -> LN ----
+        # concat → Linear → LN
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
@@ -1973,8 +2034,6 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list: list,
         seq_masks_list: list,
         apply_dropout: bool = True,
-        fid_tokens_list: Optional[list] = None,
-        time_deltas_list: Optional[list] = None,
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection.
 
@@ -1985,12 +2044,11 @@ class PCVRHyFormer(nn.Module):
         the final output, providing a gradient highway that bypasses all blocks
         and prevents the optimizer from losing low-level static-feature signal.
 
-        r6 (sid_mode='fid_order'): fid_tokens_list and time_deltas_list are
-        provided. Before each block k, seq tokens are rebuilt as the prefix-sum
-        of the first k_fids(k) fid projections + time_delta, then LayerNorm.
-        k_fids is scheduled linearly: block 0 uses ceil(S * (1/N_blocks)) fids,
-        block N-1 uses all S fids — coarse-to-fine information injection.
-        The LayerNorm (self._seq_proj[domain]) is shared across all layers.
+        r6 (sid_mode='fid_order'): The seq tokens and NS tokens fed into this
+        method are already built with the desired reveal_ratio (zero-ed out fids
+        for masked features).  No per-block scheduling is performed here; the
+        coarse-to-fine effect is achieved at the training step level by calling
+        forward() multiple times with increasing reveal_ratio values.
         """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
@@ -2006,45 +2064,7 @@ class PCVRHyFormer(nn.Module):
         curr_seqs = seq_tokens_list
         curr_masks = seq_masks_list
 
-        # r6: precompute per-block fid reveal count for each domain
-        # fid_schedule[block_idx][domain_idx] = number of fids to use at that block
-        use_fid_order = (self.sid_mode == 'fid_order'
-                         and fid_tokens_list is not None
-                         and time_deltas_list is not None)
-        fid_schedule = None
-        if use_fid_order:
-            num_blocks = len(self.blocks)
-            fid_schedule = []
-            for blk_idx in range(num_blocks):
-                per_domain = []
-                for dom_idx, fid_list in enumerate(fid_tokens_list):
-                    S_i = len(fid_list)
-                    if num_blocks == 1:
-                        k = S_i
-                    else:
-                        # Linear schedule: block 0 -> ceil(S/N), block N-1 -> S
-                        k = math.ceil(S_i * (blk_idx + 1) / num_blocks)
-                        k = max(1, min(k, S_i))
-                    per_domain.append(k)
-                fid_schedule.append(per_domain)
-
         for blk_idx, block in enumerate(self.blocks):
-            # r6: rebuild seq tokens using the fid prefix for this block layer
-            if use_fid_order:
-                new_seqs = []
-                for dom_idx, (fid_list, time_delta) in enumerate(
-                        zip(fid_tokens_list, time_deltas_list)):
-                    k = fid_schedule[blk_idx][dom_idx]
-                    domain = self.seq_domains[dom_idx]
-                    ln = self._seq_proj[domain]
-                    # Prefix-sum of first k fid projections + temporal delta
-                    prefix_token = sum(fid_list[:k]) + time_delta  # (B, L, D)
-                    prefix_token = ln(prefix_token)
-                    # Apply embedding dropout to the rebuilt token (same as original)
-                    if apply_dropout:
-                        prefix_token = self.emb_dropout(prefix_token)
-                    new_seqs.append(prefix_token)
-                curr_seqs = new_seqs
             # Precompute RoPE cos/sin for each sequence
             rope_cos_list = None
             rope_sin_list = None
@@ -2079,33 +2099,72 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def _build_ns_tokens(self, inputs: 'ModelInput') -> torch.Tensor:
+    def _build_ns_tokens(
+        self,
+        inputs: 'ModelInput',
+        reveal_ratio: float = 1.0,
+    ) -> torch.Tensor:
         """Build NS token tensor with Mixed Parameterization.
 
         Each source of NS tokens (user int, user dense, item int, item dense,
         temporal) passes through its own independent FFN before being
         concatenated.  This prevents the semantically heterogeneous tokens from
         sharing parameters in the early projection stage (OneTrans insight).
+
+        Args:
+            inputs: model input namedtuple.
+            reveal_ratio: fraction of fids to reveal in fid_order mode.
+                1.0 = all fids (default / inference).  Only effective when
+                self.sid_mode == 'fid_order'.
         """
+        # --- Build fid_masks for DIG-style partial reveal ---
+        user_fid_mask: Optional[List[bool]] = None
+        item_fid_mask: Optional[List[bool]] = None
+        if self.sid_mode == 'fid_order' and reveal_ratio < 1.0:
+            n_user = len(self._user_fid_reveal_order)
+            k_user = max(1, math.ceil(n_user * reveal_ratio))
+            active_user = set(self._user_fid_reveal_order[:k_user])
+            user_fid_mask = [i in active_user for i in range(n_user)]
+
+            n_item = len(self._item_fid_reveal_order)
+            k_item = max(1, math.ceil(n_item * reveal_ratio))
+            active_item = set(self._item_fid_reveal_order[:k_item])
+            item_fid_mask = [i in active_item for i in range(n_item)]
+
         # --- user int NS tokens ---
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_ns, D)
-        user_ns = user_ns + self.user_ns_ffn(user_ns)             # residual per-token FFN
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats, fid_mask=user_fid_mask)   # (B, num_user_ns, D)
+        user_ns = user_ns + self.user_ns_ffn(user_ns)        # residual per-token FFN
 
         # --- item int NS tokens ---
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_ns, D)
-        item_ns = item_ns + self.item_ns_ffn(item_ns)             # residual per-token FFN
+        item_ns = self.item_ns_tokenizer(
+            inputs.item_int_feats, fid_mask=item_fid_mask)   # (B, num_item_ns, D)
+        item_ns = item_ns + self.item_ns_ffn(item_ns)        # residual per-token FFN
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_raw = self.dense_input_dropout(inputs.user_dense_feats)  # Dropout before proj
-            user_dense_tok = F.silu(self.user_dense_proj(user_dense_raw)).unsqueeze(1)  # (B,1,D)
-            user_dense_tok = user_dense_tok + self.user_dense_ffn(user_dense_tok)
+            # user_dense is treated as one atomic feature group.
+            # In fid_order mode, reveal it only when reveal_ratio >= 0.5 (mid-point).
+            # This gives the model some "warm up" steps without dense features.
+            use_user_dense = (self.sid_mode != 'fid_order') or (reveal_ratio >= 0.5)
+            if use_user_dense:
+                user_dense_raw = self.dense_input_dropout(inputs.user_dense_feats)
+                user_dense_tok = F.silu(self.user_dense_proj(user_dense_raw)).unsqueeze(1)  # (B,1,D)
+                user_dense_tok = user_dense_tok + self.user_dense_ffn(user_dense_tok)
+            else:
+                B = inputs.user_int_feats.shape[0]
+                user_dense_tok = inputs.user_int_feats.new_zeros(B, 1, self.d_model, dtype=torch.float)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
-            item_dense_raw = self.dense_input_dropout(inputs.item_dense_feats)  # Dropout before proj
-            item_dense_tok = F.silu(self.item_dense_proj(item_dense_raw)).unsqueeze(1)  # (B,1,D)
-            item_dense_tok = item_dense_tok + self.item_dense_ffn(item_dense_tok)
+            use_item_dense = (self.sid_mode != 'fid_order') or (reveal_ratio >= 0.5)
+            if use_item_dense:
+                item_dense_raw = self.dense_input_dropout(inputs.item_dense_feats)
+                item_dense_tok = F.silu(self.item_dense_proj(item_dense_raw)).unsqueeze(1)  # (B,1,D)
+                item_dense_tok = item_dense_tok + self.item_dense_ffn(item_dense_tok)
+            else:
+                B = inputs.user_int_feats.shape[0]
+                item_dense_tok = inputs.user_int_feats.new_zeros(B, 1, self.d_model, dtype=torch.float)
             ns_parts.append(item_dense_tok)
 
         # --- Target (request) temporal token ---
@@ -2134,59 +2193,36 @@ class PCVRHyFormer(nn.Module):
         return torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
     def _build_seq_tokens(
-        self, inputs: 'ModelInput'
-    ):
+        self,
+        inputs: 'ModelInput',
+        reveal_ratio: float = 1.0,
+    ) -> Tuple[list, list]:
         """Embed all sequence domains.
 
-        sid_mode='none':
-            Returns (seq_tokens_list, seq_masks_list).
-            seq_tokens_list: list of (B, L, D) tensors.
+        Returns (seq_tokens_list, seq_masks_list).
+        seq_tokens_list: list of (B, L, D) tensors, one per domain.
 
-        sid_mode='fid_order':
-            Returns (seq_tokens_list, seq_masks_list,
-                     fid_tokens_list, time_deltas_list).
-            seq_tokens_list: initial token = prefix-sum of ALL fid projs + time_delta
-                             (used by query_generator; blocks will get layer-specific tokens).
-            fid_tokens_list: list of lists — fid_tokens_list[i] is a list of S_i
-                             (B, L, D) tensors, one per fid, for domain i.
-            time_deltas_list: list of (B, L, D) tensors, one per domain.
+        Args:
+            inputs: ModelInput namedtuple.
+            reveal_ratio: fraction of fids to reveal in fid_order mode.
+                1.0 = all fids (no masking).  When < 1.0, each domain's fids
+                are masked according to _seq_fid_reveal_order and reveal_ratio.
         """
         seq_tokens_list = []
         seq_masks_list = []
 
-        if self.sid_mode == 'fid_order':
-            fid_tokens_list = []   # per-domain list of per-fid tensors
-            time_deltas_list = []  # per-domain time delta tensor
-
-            for domain in self.seq_domains:
-                fid_projs = self._seq_fid_projs[domain]
-                ln = self._seq_proj[domain]  # shared LayerNorm
-                fid_token_list, time_delta = self._embed_seq_domain(
-                    inputs.seq_data[domain],
-                    self._seq_embs[domain], ln,
-                    self._seq_is_id[domain], self._seq_emb_index[domain],
-                    inputs.seq_time_buckets[domain],
-                    seq_hour_ids=inputs.seq_hours.get(domain) if inputs.seq_hours else None,
-                    seq_weekday_ids=inputs.seq_weekdays.get(domain) if inputs.seq_weekdays else None,
-                    seq_diff_hour_ids=inputs.seq_diff_hours.get(domain) if inputs.seq_diff_hours else None,
-                    seq_diff_day_ids=inputs.seq_diff_days.get(domain) if inputs.seq_diff_days else None,
-                    seq_diff_week_ids=inputs.seq_diff_weeks.get(domain) if inputs.seq_diff_weeks else None,
-                    fid_projs=fid_projs,
-                )
-                # Full token = sum of all fid projs + time_delta, then LN
-                full_token = sum(fid_token_list) + time_delta  # (B, L, D)
-                full_token = ln(full_token)
-                seq_tokens_list.append(full_token)
-                fid_tokens_list.append(fid_token_list)
-                time_deltas_list.append(time_delta)
-                mask = self._make_padding_mask(
-                    inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
-                seq_masks_list.append(mask)
-
-            return seq_tokens_list, seq_masks_list, fid_tokens_list, time_deltas_list
-
-        # ---- original path ----
         for domain in self.seq_domains:
+            vs = self._seq_vocab_sizes[domain]
+            S = len(vs)
+            # Compute reveal_k for this domain
+            reveal_order: Optional[List[int]] = None
+            reveal_k: int = -1
+            if (self.sid_mode == 'fid_order'
+                    and reveal_ratio < 1.0
+                    and domain in self._seq_fid_reveal_order):
+                reveal_order = self._seq_fid_reveal_order[domain]
+                reveal_k = max(1, math.ceil(S * reveal_ratio))
+
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
@@ -2197,35 +2233,42 @@ class PCVRHyFormer(nn.Module):
                 seq_diff_hour_ids=inputs.seq_diff_hours.get(domain) if inputs.seq_diff_hours else None,
                 seq_diff_day_ids=inputs.seq_diff_days.get(domain) if inputs.seq_diff_days else None,
                 seq_diff_week_ids=inputs.seq_diff_weeks.get(domain) if inputs.seq_diff_weeks else None,
+                reveal_order=reveal_order,
+                reveal_k=reveal_k,
             )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
         return seq_tokens_list, seq_masks_list
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection + optional target-time token
-        ns_tokens = self._build_ns_tokens(inputs)  # (B, num_ns, D)
+    def forward(
+        self,
+        inputs: ModelInput,
+        reveal_ratio: float = 1.0,
+    ) -> torch.Tensor:
+        """Runs the forward pass of the PCVRHyFormer model.
 
-        # 2. Embed each sequence domain (dynamic)
-        # sid_mode='none':      returns (seq_tokens_list, seq_masks_list)
-        # sid_mode='fid_order': returns (seq_tokens_list, seq_masks_list,
-        #                                fid_tokens_list, time_deltas_list)
-        seq_build_out = self._build_seq_tokens(inputs)
-        seq_tokens_list, seq_masks_list = seq_build_out[0], seq_build_out[1]
-        fid_tokens_list = seq_build_out[2] if len(seq_build_out) > 2 else None
-        time_deltas_list = seq_build_out[3] if len(seq_build_out) > 3 else None
+        Args:
+            inputs: ModelInput namedtuple.
+            reveal_ratio: Fraction of fids to reveal (0 < ratio <= 1).
+                1.0 = use all features (default / inference / sid_mode='none').
+                < 1.0 only has effect when sid_mode='fid_order'; the first
+                ceil(N*ratio) fids (by coarse-to-fine order) are active.
+        """
+        # 1. NS tokens
+        ns_tokens = self._build_ns_tokens(inputs, reveal_ratio=reveal_ratio)  # (B, num_ns, D)
 
-        # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
+        # 2. Seq tokens
+        seq_tokens_list, seq_masks_list = self._build_seq_tokens(
+            inputs, reveal_ratio=reveal_ratio)
+
+        # 3. Generate independent Q tokens per sequence
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training,
-            fid_tokens_list=fid_tokens_list,
-            time_deltas_list=time_deltas_list,
         )
 
         # 5. Classifier
@@ -2233,18 +2276,16 @@ class PCVRHyFormer(nn.Module):
         return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs inference without dropout, returning both logits and embeddings."""
-        ns_tokens = self._build_ns_tokens(inputs)
-        seq_build_out = self._build_seq_tokens(inputs)
-        seq_tokens_list, seq_masks_list = seq_build_out[0], seq_build_out[1]
-        fid_tokens_list = seq_build_out[2] if len(seq_build_out) > 2 else None
-        time_deltas_list = seq_build_out[3] if len(seq_build_out) > 3 else None
+        """Runs inference without dropout, returning both logits and embeddings.
+
+        Always uses reveal_ratio=1.0 (full feature set).
+        """
+        ns_tokens = self._build_ns_tokens(inputs, reveal_ratio=1.0)
+        seq_tokens_list, seq_masks_list = self._build_seq_tokens(inputs, reveal_ratio=1.0)
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False,
-            fid_tokens_list=fid_tokens_list,
-            time_deltas_list=time_deltas_list,
         )
         logits = self.clsfier(output)
         return logits, output

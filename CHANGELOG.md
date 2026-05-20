@@ -3,68 +3,102 @@
 
 ## 2026-05-20
 
-### r6：DIG-style 逐 fid 序列信息注入（`sid_mode='fid_order'`）
+### r6：DIG-style 全特征组逐步恢复（`sid_mode='fid_order'`）
 
 #### 背景与动机
 
-参考 DIG（Discrimination Is Generation, arXiv 2605.14853）论文的核心设计：SID 通过残差量化构建层次化码本，每层 SID embedding 前缀累加（`e_sid^(1:l) = Σ eˡ[sˡ]`）可从粗到细逐步逼近完整 item 表示，作用类似于正则——浅层 block 只拿到粗粒度信息，被迫学习更泛化的表示。
+参考 DIG（Discrimination Is Generation, arXiv 2605.14853）论文的核心设计：SID 通过残差量化构建层次化码本，每层 SID embedding 前缀累加（`e_sid^(1:l) = Σ eˡ[sˡ]`）可从粗到细逐步逼近完整 item 表示，作用类似于正则——浅层 token 只拿到粗粒度信息，被迫学习更泛化的表示。
 
-TAAC 的序列每个 item 天然携带多个 sideinfo fid（schema.json 中每个序列域有 8–13 个 fid，如 item_id、shop_id、类目 id 等），这些 fid 在结构上与 DIG 的多层 SID token 对应。原实现将所有 fid concat 后一次性投影成一个 token，没有利用这种结构。
+TAAC 的特征天然有粒度层次：
+- **NS 侧**（user_int / item_int）：每个 fid 对应一个 embedding，vocab_size 越小越粗（shop 类目 < item_id）。
+- **Seq 侧**：每个行为 item 携带 8–13 个 sideinfo fid（item_id、shop_id、类目 id 等），vocab_size 同样呈粗→细梯度。
 
-**改动目标**：将 DIG 的"逐层信息恢复"映射到 TAAC，让第 k 层 block 只看到前 `k_fids(k)` 个 fid 的前缀和，`k_fids` 随 block 深度线性增大（粗→细），同时保证下游 block 参数（Attention、FFN）完全共享，与 DIG 的 prefix-sum 逻辑对应。
+**改动目标**：将 DIG 的"逐步信息恢复"训练范式映射到 TAAC 的全特征组，覆盖 `user_int`、`item_int`、`user_dense`、所有 `seq_domain`。训练时每个 step 执行 K 次 forward，每次揭示不同比例的特征子集（从粗到细），K 次 loss 平均后反传，迫使模型具备从不完整信息中恢复预测能力。
+
+**关键区别（已纠正的误解）**：DIG 的"逐层加入"与模型的 block 数**无关**。正确范式是：
+> 同一个 batch，运行 K 次 forward（每次 `reveal_ratio = k/K`），每次揭示不同粒度的特征子集，K 次 loss 都回传，模型学习"从粗到细"恢复预测能力。模型 block 参数完全共享（复用同一个前向路径）。
 
 #### 实现
 
-**关键设计决策**：
+**特征揭示顺序（coarse → fine）**：
 
-- **不用 concat → 单 Linear**，改用每个 fid 各自一个独立 `Linear(emb_dim → D)`，输出 D 维后直接累加。这样无论当前 block 使用几个 fid，输出维度始终是 D，下游 block 参数完全共享，与 DIG prefix-sum 完全对应。
-- 每层 block 前按线性调度计算 `k_fids`：
-
-```
-block 0:   k = ceil(S * 1 / N_blocks)
-block 1:   k = ceil(S * 2 / N_blocks)
-...
-block N-1: k = S  (全量 fid)
-```
-
-- 时间特征（time_bucket / hour / weekday / diff）单独收集为 `time_delta`，加到每层的前缀和上后再过共享 `LayerNorm`。
-
-**数据流**（`sid_mode='fid_order'`）：
+所有特征组按 `vocab_size` 升序排列，`vocab_size` 越小的特征越先被揭示（对应 DIG 中越粗粒度的 SID 前缀）：
 
 ```
-_build_seq_tokens()
-  ├─ _embed_seq_domain(..., fid_projs=...)
-  │    └─ 每个 fid: emb(fid_i) → Linear_i(emb_dim→D) → gelu → fid_token_i
-  │    └─ time_delta = time_bucket + hour + weekday + diff_*
-  │    └─ 返回 (fid_token_list, time_delta)
-  └─ full_token = LN(Σ fid_token_list + time_delta)   ← query_generator 用
-
-_run_multi_seq_blocks()
-  for blk_idx, block in blocks:
-      k = ceil(S * (blk_idx+1) / N)
-      seq_token = LN(Σ fid_token_list[:k] + time_delta)  ← 该层 block 用
-      block(seq_token, ...)
+user_int reveal order: sorted by vocab_size ascending
+item_int reveal order: sorted by vocab_size ascending
+seq_domain fid order:  sorted by vocab_size ascending (per domain)
+user_dense / item_dense: 视为原子特征，reveal_ratio >= 0.5 时揭示
 ```
+
+**训练数据流**（`sid_mode='fid_order'`）：
+
+```
+_train_step():
+    for k in range(K):
+        reveal_ratio = (k+1) / K          # 1/K, 2/K, ..., 1.0
+        logits = model(batch, reveal_ratio)
+        loss_sum += BCE(logits, label)
+    loss = loss_sum / K
+    loss.backward()
+
+model.forward(inputs, reveal_ratio):
+    ns_tokens = _build_ns_tokens(reveal_ratio)   # mask inactive fids → zero vec
+    seq_tokens = _build_seq_tokens(reveal_ratio) # mask inactive fids → zero vec
+    ... (same as none mode from here)
+
+_build_ns_tokens(reveal_ratio):
+    k_user = ceil(N_user * reveal_ratio)
+    active_user = set(_user_fid_reveal_order[:k_user])
+    user_fid_mask = [i in active_user for i in range(N_user)]
+    # 传入 Tokenizer，被屏蔽的 fid 输出 zero float vector
+    user_ns = user_ns_tokenizer(feats, fid_mask=user_fid_mask)
+
+_embed_seq_domain(..., reveal_order, reveal_k):
+    active_fids = set(reveal_order[:reveal_k])
+    # fid not in active_fids → zero float vector (dtype=float)
+```
+
+**参数共享**：屏蔽操作发生在 embedding 层（zeroing），后续的 `concat → Linear → LN` 投影参数在所有揭示比例下完全共享，与 DIG 的 prefix-sum 语义对应。
 
 #### 新增参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `sid_mode` | `'none'` | `'none'` = 原有行为；`'fid_order'` = 逐 fid 前缀注入 |
+| `sid_mode` | `'none'` | `'none'` = 原有行为；`'fid_order'` = DIG-style 逐步特征恢复 |
+| `dig_steps` | `4` | `fid_order` 模式下每个训练 step 的 forward 次数 K（K 越大正则越强但计算量越高） |
 
-- `sid_mode='none'`：行为与原始完全相同，旧 checkpoint 可直接加载。
-- `sid_mode='fid_order'`：新增 `_seq_fid_projs`（每个域 S 个 `Linear(emb_dim→D)`）和共享 `LayerNorm`，替换原来的 `Linear(S*emb_dim→D) + LayerNorm`。
+- `sid_mode='none'`：行为与原始完全相同，旧 checkpoint 可直接加载，无任何额外开销。
+- `sid_mode='fid_order'`：无需新增 per-fid 参数，复用原有 `Linear(S×emb_dim → D) + LayerNorm`，训练时 reveal_ratio 控制哪些 fid embedding 为零向量。
+- **推理时**：`predict()` 始终使用 `reveal_ratio=1.0`（等价于 `none` 模式），无额外推理开销。
 
 #### 改动文件
 
 - `model.py`：
-  - `PCVRHyFormer.__init__`：新增 `sid_mode` 参数；`_seq_fid_projs`（`nn.ModuleDict`）；`fid_order` 时 `_seq_proj` 改为共享 `LayerNorm`。
-  - `_embed_seq_domain`：新增 `fid_projs` 参数，`fid_order` 路径返回 `(fid_token_list, time_delta)`。
-  - `_build_seq_tokens`：`fid_order` 模式下额外返回 `fid_tokens_list` 和 `time_deltas_list`。
-  - `_run_multi_seq_blocks`：新增 `fid_tokens_list` / `time_deltas_list` 参数；`fid_order` 模式下每层 block 前重建 seq token。
-  - `forward` / `predict`：解包 `_build_seq_tokens` 返回值，透传给 `_run_multi_seq_blocks`。
-- `train.py`：新增 `--sid_mode` CLI 参数（choices: `none` / `fid_order`，默认 `none`）；`model_args` 加 `sid_mode`。
-- `infer.py`：`_FALLBACK_MODEL_CFG` 加 `'sid_mode': 'none'`。
+  - `PCVRHyFormer.__init__`：新增 `sid_mode` / `dig_steps` 参数；`fid_order` 时计算并存储 `_user_fid_reveal_order`、`_item_fid_reveal_order`、`_seq_fid_reveal_order`（按 vocab_size 升序排列的 fid 索引列表）。
+  - `GroupNSTokenizer.forward` / `RankMixerNSTokenizer.forward`：新增 `fid_mask: Optional[List[bool]]` 参数；被屏蔽 fid 输出 `new_zeros(..., dtype=torch.float)` 零向量（修复 Long/Float dtype 类型错误）。
+  - `_embed_seq_domain`：新增 `reveal_order: Optional[List[int]]` / `reveal_k: int` 参数；根据 `reveal_k` 屏蔽序列特征（替换为 zero float vector）。
+  - `_build_ns_tokens`：新增 `reveal_ratio: float = 1.0` 参数；`fid_order` 模式下计算 `user_fid_mask` / `item_fid_mask` 传给 Tokenizer；`user_dense` / `item_dense` 在 `reveal_ratio < 0.5` 时整体屏蔽。
+  - `_build_seq_tokens`：新增 `reveal_ratio: float = 1.0` 参数；`fid_order` 模式下计算每个 domain 的 `reveal_k` 和 `reveal_order` 传给 `_embed_seq_domain`。
+  - `forward`：新增 `reveal_ratio: float = 1.0` 参数，透传给 `_build_ns_tokens` 和 `_build_seq_tokens`。
+  - `predict`：明确以 `reveal_ratio=1.0` 调用 `forward`，确保推理行为不变。
+  - `_run_multi_seq_blocks`：**删除**旧的 `fid_tokens_list` / `time_deltas_list` / per-block 调度逻辑；接收已按 `reveal_ratio` 屏蔽好的 `seq_tokens_list`，无感知 DIG 细节。
+- `train.py`：新增 `--sid_mode` / `--dig_steps` CLI 参数；`model_args` 加 `sid_mode` / `dig_steps`。
+- `trainer.py`（`_train_step`）：新增 `_compute_loss` 辅助函数；`fid_order` 模式下循环 K 次 forward，平均 loss 后反传。
+- `infer.py`：`_FALLBACK_MODEL_CFG` 加 `'dig_steps': 4`。
+- `run.sh`：新增 `--dig_steps 4`；更新 `--sid_mode` 注释说明 DIG 训练范式。
+
+#### 验证（smoke test `_smoke_test_r6.py`）
+
+```
+none mode forward: torch.Size([4, 1])                              ✓
+fid_order mode: 0.25, 0.5, 0.75, 1.0 均输出 torch.Size([4, 1])   ✓
+predict: logits=[4,1], emb=[4,32]                                  ✓
+user_int reveal order: [0,1,2,3] (vocab 5<10<1000<50000)          ✓
+seq reveal orders verified                                         ✓
+DIG loss simulation (K=4): avg_loss=0.5816                        ✓
+ALL TESTS PASSED
+```
 
 ---
 

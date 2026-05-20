@@ -71,6 +71,7 @@ _FALLBACK_MODEL_CFG = {
     'use_temporal_features': True,
     'csa_top_k': 0,
     'sid_mode': 'none',
+    'dig_steps': 4,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

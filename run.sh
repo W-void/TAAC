@@ -7,8 +7,14 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #   = 2 * 4 + (user_ns=4 + user_dense=1 + item_ns=2 + temporal=1) = 8 + 8 = 16
 # d_model=64 divisible by T=16 ✓
 #
-# sid_mode: 'none' = original behavior (all fids concat -> one token)
-#           'fid_order' = r6 DIG-style coarse-to-fine fid injection
+# sid_mode: 'none'      = original behavior (full feature set every forward pass)
+#           'fid_order' = r6 DIG-style coarse-to-fine regularisation:
+#                         each training step runs --dig_steps forward passes with
+#                         reveal_ratio=1/K,...,1 (K=dig_steps).  Fids sorted by
+#                         vocab_size (coarse→fine); losses averaged.  Covers
+#                         user_int, item_int, user_dense, and all seq domains.
+#                         Inference always uses full feature set.
+# dig_steps: number of forward passes per training step in fid_order mode (K=4)
 # csa_top_k: r2 CSA sparse attention; keep top-k seq tokens per cross-attention step
 #            50 ≈ 20% of min seq_max_len (256); 0 = disabled
 python3 -u "${SCRIPT_DIR}/train.py" \
@@ -18,15 +24,16 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
-    --sid_mode none \
+    --sid_mode fid_order \
+    --dig_steps 4 \
     --csa_top_k 50 \
     --num_workers 8 \
     "$@"
 
 # ---- r6 ablation: fid_order mode (DIG-style coarse-to-fine) ----
-# Switch --sid_mode to fid_order to enable per-fid Linear(emb_dim->D) + prefix-sum.
-# Each block k sees prefix-sum of first ceil(S*(k+1)/N) fid projections.
-# To run: change --sid_mode none -> --sid_mode fid_order above.
+# To enable: change --sid_mode none -> --sid_mode fid_order above.
+# The model will run 4 forward passes per step (reveal_ratio=0.25,0.5,0.75,1.0),
+# covering user_int, item_int, user_dense, and all seq domains simultaneously.
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).

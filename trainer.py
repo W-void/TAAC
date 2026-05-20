@@ -423,8 +423,20 @@ class PCVRHyFormerRankingTrainer:
             seq_diff_weeks=seq_diff_weeks if seq_diff_weeks else None,
         )
 
+    def _compute_loss(self, logits: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        """Compute loss from logits and labels."""
+        if self.loss_type == 'focal':
+            return sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        return F.binary_cross_entropy_with_logits(logits, label)
+
     def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value."""
+        """Run a single training step and return the scalar loss value.
+
+        r6 (sid_mode='fid_order'): runs dig_steps forward passes with
+        reveal_ratio = 1/K, 2/K, …, 1.  The final loss is the mean over
+        all K passes, which forces the model to predict from partial feature
+        sets (coarse-to-fine regularisation, DIG-style).
+        """
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
@@ -433,13 +445,29 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        # Check if model is in fid_order mode
+        use_dig = (
+            hasattr(self.model, 'sid_mode')
+            and self.model.sid_mode == 'fid_order'
+        )
+
+        if use_dig:
+            # DIG training: multiple forward passes with increasing reveal_ratio.
+            # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
+            K = self.model.dig_steps
+            loss_sum = torch.tensor(0.0, device=self.device)
+            for step_idx in range(K):
+                reveal_ratio = (step_idx + 1) / K
+                logits = self.model(model_input, reveal_ratio=reveal_ratio)
+                logits = logits.squeeze(-1)
+                loss_sum = loss_sum + self._compute_loss(logits, label)
+            loss = loss_sum / K
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
+            loss = self._compute_loss(logits, label)
+
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
