@@ -70,6 +70,7 @@ _FALLBACK_MODEL_CFG = {
     'item_ns_tokens': 0,
     'use_temporal_features': True,
     'csa_top_k': 0,
+    'sid_mode': 'none',
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

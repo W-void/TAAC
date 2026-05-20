@@ -1443,6 +1443,12 @@ class PCVRHyFormer(nn.Module):
         # r2: CSA top-k — 0 = disabled; >0 = keep only top-csa_top_k seq tokens
         # per Cross-Attention query (by dot-product relevance)
         csa_top_k: int = 0,
+        # r6: DIG-style sequential feature injection mode
+        # 'none'       = original behavior (all fids concat → one Linear → one token)
+        # 'fid_order'  = each fid has its own Linear(emb_dim→D); Block k sees
+        #                the prefix-sum of the first k_fids(k) fid projections,
+        #                where k_fids grows linearly across blocks (coarse→fine).
+        sid_mode: str = 'none',
     ) -> None:
         super().__init__()
 
@@ -1459,6 +1465,9 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        assert sid_mode in ('none', 'fid_order'), \
+            f"sid_mode must be 'none' or 'fid_order', got {sid_mode!r}"
+        self.sid_mode = sid_mode
 
         # ================== NS Tokens Construction ==================
 
@@ -1593,6 +1602,9 @@ class PCVRHyFormer(nn.Module):
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
 
+        # {domain: ModuleList of per-fid Linear(emb_dim→D)} — only used in fid_order mode
+        self._seq_fid_projs = nn.ModuleDict()
+
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
             embs, idx_map, is_id = _make_seq_embs(vs)
@@ -1600,10 +1612,20 @@ class PCVRHyFormer(nn.Module):
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
             self._seq_vocab_sizes[domain] = vs
-            self._seq_proj[domain] = nn.Sequential(
-                nn.Linear(len(vs) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
-            )
+            if sid_mode == 'fid_order':
+                # Each fid gets its own Linear(emb_dim → d_model) + shared LN
+                # The proj input is always emb_dim regardless of fid count,
+                # so downstream blocks see a fixed-dim token after prefix-sum.
+                self._seq_fid_projs[domain] = nn.ModuleList([
+                    nn.Linear(emb_dim, d_model) for _ in range(len(vs))
+                ])
+                # Shared LayerNorm applied to the accumulated token
+                self._seq_proj[domain] = nn.LayerNorm(d_model)
+            else:
+                self._seq_proj[domain] = nn.Sequential(
+                    nn.Linear(len(vs) * emb_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1846,14 +1868,27 @@ class PCVRHyFormer(nn.Module):
         seq_diff_hour_ids: Optional[torch.Tensor] = None,
         seq_diff_day_ids: Optional[torch.Tensor] = None,
         seq_diff_week_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
+        fid_projs: Optional[nn.ModuleList] = None,
+    ):
+        """Embeds a sequence domain.
+
+        sid_mode='none' (fid_projs is None):
+            Returns a single (B, L, D) tensor — original behaviour.
+
+        sid_mode='fid_order' (fid_projs is not None):
+            Returns a list of S tensors, each (B, L, D).
+            Each tensor is the projection of one fid's embedding via its own
+            Linear(emb_dim -> D).  Temporal embeddings are returned separately
+            as a (B, L, D) tensor (second return value) so that _build_seq_tokens
+            can add them to any prefix-sum at the right layer.
+            Return type: Tuple[List[Tensor], Tensor]  where the second element
+            is the combined temporal delta to add to each layer's token.
+        """
         B, S, L = seq.shape
         emb_list = []
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
             if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
@@ -1861,6 +1896,38 @@ class PCVRHyFormer(nn.Module):
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
+
+        # ---- fid_order mode: return per-fid projected tensors ----
+        if fid_projs is not None:
+            # Project each fid embedding independently: (B, L, emb_dim) -> (B, L, D)
+            fid_token_list = []
+            for i, (raw_emb, fid_linear) in enumerate(zip(emb_list, fid_projs)):
+                fid_token_list.append(F.gelu(fid_linear(raw_emb)))  # (B, L, D)
+
+            # Build temporal delta (same shape D, added once to the final token level)
+            time_delta = seq.new_zeros(B, L, self.d_model, dtype=torch.float)
+            if self.num_time_buckets > 0:
+                time_delta = time_delta + self.time_embedding(time_bucket_ids)
+            if self.use_temporal_features:
+                if seq_hour_ids is not None:
+                    h_emb = self.seq_hour_emb(seq_hour_ids)
+                    if self.training:
+                        h_emb = self.abs_time_dropout(h_emb)
+                    time_delta = time_delta + h_emb
+                if seq_weekday_ids is not None:
+                    w_emb = self.seq_weekday_emb(seq_weekday_ids)
+                    if self.training:
+                        w_emb = self.abs_time_dropout(w_emb)
+                    time_delta = time_delta + w_emb
+                if seq_diff_hour_ids is not None:
+                    time_delta = time_delta + self.seq_diff_hour_emb(seq_diff_hour_ids)
+                if seq_diff_day_ids is not None:
+                    time_delta = time_delta + self.seq_diff_day_emb(seq_diff_day_ids)
+                if seq_diff_week_ids is not None:
+                    time_delta = time_delta + self.seq_diff_week_emb(seq_diff_week_ids)
+            return fid_token_list, time_delta
+
+        # ---- original mode (sid_mode='none'): concat -> Linear -> LN ----
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
@@ -1905,7 +1972,9 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
+        apply_dropout: bool = True,
+        fid_tokens_list: Optional[list] = None,
+        time_deltas_list: Optional[list] = None,
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection.
 
@@ -1915,6 +1984,13 @@ class PCVRHyFormer(nn.Module):
         r5: The initial NS token flat vector is projected to D and added to
         the final output, providing a gradient highway that bypasses all blocks
         and prevents the optimizer from losing low-level static-feature signal.
+
+        r6 (sid_mode='fid_order'): fid_tokens_list and time_deltas_list are
+        provided. Before each block k, seq tokens are rebuilt as the prefix-sum
+        of the first k_fids(k) fid projections + time_delta, then LayerNorm.
+        k_fids is scheduled linearly: block 0 uses ceil(S * (1/N_blocks)) fids,
+        block N-1 uses all S fids — coarse-to-fine information injection.
+        The LayerNorm (self._seq_proj[domain]) is shared across all layers.
         """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
@@ -1930,7 +2006,45 @@ class PCVRHyFormer(nn.Module):
         curr_seqs = seq_tokens_list
         curr_masks = seq_masks_list
 
-        for block in self.blocks:
+        # r6: precompute per-block fid reveal count for each domain
+        # fid_schedule[block_idx][domain_idx] = number of fids to use at that block
+        use_fid_order = (self.sid_mode == 'fid_order'
+                         and fid_tokens_list is not None
+                         and time_deltas_list is not None)
+        fid_schedule = None
+        if use_fid_order:
+            num_blocks = len(self.blocks)
+            fid_schedule = []
+            for blk_idx in range(num_blocks):
+                per_domain = []
+                for dom_idx, fid_list in enumerate(fid_tokens_list):
+                    S_i = len(fid_list)
+                    if num_blocks == 1:
+                        k = S_i
+                    else:
+                        # Linear schedule: block 0 -> ceil(S/N), block N-1 -> S
+                        k = math.ceil(S_i * (blk_idx + 1) / num_blocks)
+                        k = max(1, min(k, S_i))
+                    per_domain.append(k)
+                fid_schedule.append(per_domain)
+
+        for blk_idx, block in enumerate(self.blocks):
+            # r6: rebuild seq tokens using the fid prefix for this block layer
+            if use_fid_order:
+                new_seqs = []
+                for dom_idx, (fid_list, time_delta) in enumerate(
+                        zip(fid_tokens_list, time_deltas_list)):
+                    k = fid_schedule[blk_idx][dom_idx]
+                    domain = self.seq_domains[dom_idx]
+                    ln = self._seq_proj[domain]
+                    # Prefix-sum of first k fid projections + temporal delta
+                    prefix_token = sum(fid_list[:k]) + time_delta  # (B, L, D)
+                    prefix_token = ln(prefix_token)
+                    # Apply embedding dropout to the rebuilt token (same as original)
+                    if apply_dropout:
+                        prefix_token = self.emb_dropout(prefix_token)
+                    new_seqs.append(prefix_token)
+                curr_seqs = new_seqs
             # Precompute RoPE cos/sin for each sequence
             rope_cos_list = None
             rope_sin_list = None
@@ -2021,10 +2135,57 @@ class PCVRHyFormer(nn.Module):
 
     def _build_seq_tokens(
         self, inputs: 'ModelInput'
-    ) -> Tuple[list, list]:
-        """Embed all sequence domains, return (seq_tokens_list, seq_masks_list)."""
+    ):
+        """Embed all sequence domains.
+
+        sid_mode='none':
+            Returns (seq_tokens_list, seq_masks_list).
+            seq_tokens_list: list of (B, L, D) tensors.
+
+        sid_mode='fid_order':
+            Returns (seq_tokens_list, seq_masks_list,
+                     fid_tokens_list, time_deltas_list).
+            seq_tokens_list: initial token = prefix-sum of ALL fid projs + time_delta
+                             (used by query_generator; blocks will get layer-specific tokens).
+            fid_tokens_list: list of lists — fid_tokens_list[i] is a list of S_i
+                             (B, L, D) tensors, one per fid, for domain i.
+            time_deltas_list: list of (B, L, D) tensors, one per domain.
+        """
         seq_tokens_list = []
         seq_masks_list = []
+
+        if self.sid_mode == 'fid_order':
+            fid_tokens_list = []   # per-domain list of per-fid tensors
+            time_deltas_list = []  # per-domain time delta tensor
+
+            for domain in self.seq_domains:
+                fid_projs = self._seq_fid_projs[domain]
+                ln = self._seq_proj[domain]  # shared LayerNorm
+                fid_token_list, time_delta = self._embed_seq_domain(
+                    inputs.seq_data[domain],
+                    self._seq_embs[domain], ln,
+                    self._seq_is_id[domain], self._seq_emb_index[domain],
+                    inputs.seq_time_buckets[domain],
+                    seq_hour_ids=inputs.seq_hours.get(domain) if inputs.seq_hours else None,
+                    seq_weekday_ids=inputs.seq_weekdays.get(domain) if inputs.seq_weekdays else None,
+                    seq_diff_hour_ids=inputs.seq_diff_hours.get(domain) if inputs.seq_diff_hours else None,
+                    seq_diff_day_ids=inputs.seq_diff_days.get(domain) if inputs.seq_diff_days else None,
+                    seq_diff_week_ids=inputs.seq_diff_weeks.get(domain) if inputs.seq_diff_weeks else None,
+                    fid_projs=fid_projs,
+                )
+                # Full token = sum of all fid projs + time_delta, then LN
+                full_token = sum(fid_token_list) + time_delta  # (B, L, D)
+                full_token = ln(full_token)
+                seq_tokens_list.append(full_token)
+                fid_tokens_list.append(fid_token_list)
+                time_deltas_list.append(time_delta)
+                mask = self._make_padding_mask(
+                    inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
+                seq_masks_list.append(mask)
+
+            return seq_tokens_list, seq_masks_list, fid_tokens_list, time_deltas_list
+
+        # ---- original path ----
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
@@ -2048,7 +2209,13 @@ class PCVRHyFormer(nn.Module):
         ns_tokens = self._build_ns_tokens(inputs)  # (B, num_ns, D)
 
         # 2. Embed each sequence domain (dynamic)
-        seq_tokens_list, seq_masks_list = self._build_seq_tokens(inputs)
+        # sid_mode='none':      returns (seq_tokens_list, seq_masks_list)
+        # sid_mode='fid_order': returns (seq_tokens_list, seq_masks_list,
+        #                                fid_tokens_list, time_deltas_list)
+        seq_build_out = self._build_seq_tokens(inputs)
+        seq_tokens_list, seq_masks_list = seq_build_out[0], seq_build_out[1]
+        fid_tokens_list = seq_build_out[2] if len(seq_build_out) > 2 else None
+        time_deltas_list = seq_build_out[3] if len(seq_build_out) > 3 else None
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
@@ -2056,7 +2223,9 @@ class PCVRHyFormer(nn.Module):
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
+            apply_dropout=self.training,
+            fid_tokens_list=fid_tokens_list,
+            time_deltas_list=time_deltas_list,
         )
 
         # 5. Classifier
@@ -2066,11 +2235,16 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         ns_tokens = self._build_ns_tokens(inputs)
-        seq_tokens_list, seq_masks_list = self._build_seq_tokens(inputs)
+        seq_build_out = self._build_seq_tokens(inputs)
+        seq_tokens_list, seq_masks_list = seq_build_out[0], seq_build_out[1]
+        fid_tokens_list = seq_build_out[2] if len(seq_build_out) > 2 else None
+        time_deltas_list = seq_build_out[3] if len(seq_build_out) > 3 else None
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
+            apply_dropout=False,
+            fid_tokens_list=fid_tokens_list,
+            time_deltas_list=time_deltas_list,
         )
         logits = self.clsfier(output)
         return logits, output

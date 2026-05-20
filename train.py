@@ -206,6 +206,13 @@ def parse_args() -> argparse.Namespace:
                              'similarity with the mean Q token. '
                              '0 = disabled (use all seq tokens). '
                              'Typical value: same as --seq_top_k.')
+    parser.add_argument('--sid_mode', type=str, default='none',
+                        choices=['none', 'fid_order'],
+                        help='r6: DIG-style coarse-to-fine feature injection mode. '
+                             'none = original behavior (all fids concat -> one token). '
+                             'fid_order = each fid has its own Linear(emb_dim->D); '
+                             'block k sees prefix-sum of first k_fids fid projections, '
+                             'where k_fids grows linearly across blocks.')
 
     args = parser.parse_args()
 
@@ -316,6 +323,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "csa_top_k": args.csa_top_k,
+        "sid_mode": args.sid_mode,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
