@@ -869,7 +869,12 @@ class DynamicQueryRefiner(nn.Module):
     updated NS tokens at each block, instead of reusing the initial Q.
 
     Per-sequence: Q_i = LayerNorm(NS_mean + domain_emb_i + seq_pool_i)
-    projected via a lightweight linear.
+    projected via Nq **independent** Linear(D→D) heads (one per query slot).
+
+    Using independent projections per query slot (instead of a single
+    Linear(D→Nq*D) + reshape) structurally prevents query collapse: each
+    head has its own parameter space and gradient path, so the optimizer is
+    free to specialise them without any explicit regularisation.
 
     Args:
         d_model: Token dimension.
@@ -898,13 +903,17 @@ class DynamicQueryRefiner(nn.Module):
             nn.LayerNorm(d_model) for _ in range(num_sequences)
         ])
 
-        # Per-sequence, per-query linear to produce Q tokens
-        # Input: d_model (context), Output: num_queries * d_model
+        # Per-sequence, per-query independent Linear(D→D) + LayerNorm.
+        # Nq separate heads ensure each query slot has its own gradient path,
+        # preventing the collapsed-Q failure mode where all queries converge.
         self.q_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, num_queries * d_model),
-                nn.LayerNorm(num_queries * d_model),
-            )
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for _ in range(num_queries)
+            ])
             for _ in range(num_sequences)
         ])
 
@@ -944,9 +953,9 @@ class DynamicQueryRefiner(nn.Module):
             ctx = ns_mean + seq_mean + domain_bias  # (B, D)
             ctx = self.ctx_norms[i](ctx)
 
-            # Project to num_queries * D then reshape
-            q_flat = self.q_projs[i](ctx)           # (B, Nq*D)
-            q_i = q_flat.view(B, self.num_queries, self.d_model)  # (B, Nq, D)
+            # Each query slot has its own independent Linear(D→D)
+            qs = [proj(ctx) for proj in self.q_projs[i]]  # Nq × (B, D)
+            q_i = torch.stack(qs, dim=1)                  # (B, Nq, D)
             q_list.append(q_i)
 
         return q_list
@@ -1945,6 +1954,7 @@ class PCVRHyFormer(nn.Module):
         seq_diff_week_ids: Optional[torch.Tensor] = None,
         reveal_order: Optional[List[int]] = None,
         reveal_k: int = -1,
+        time_reveal_k: int = -1,
     ) -> torch.Tensor:
         """Embeds a sequence domain into a single (B, L, D) token.
 
@@ -1961,6 +1971,16 @@ class PCVRHyFormer(nn.Module):
                 in reveal_order is < reveal_k are active; the rest are zeroed.
                 reveal_order=None means no masking (full feature set).
             reveal_k: number of fids to reveal (active).  -1 or >= S → all.
+            time_reveal_k: DIG coarse-to-fine for temporal features.
+                Controls how many temporal features (in granularity order) are
+                active.  The 6 temporal slots (coarse→fine) are:
+                  0: time_bucket   (coarsest — relative bucket)
+                  1: diff_week     (relative diff, week granularity)
+                  2: diff_day      (relative diff, day granularity)
+                  3: weekday       (absolute weekday, coarse)
+                  4: diff_hour     (relative diff, hour granularity)
+                  5: hour          (absolute hour, finest)
+                -1 or >= 6 means all temporal features are active (default).
 
         Returns:
             (B, L, D) sequence token tensor.
@@ -1992,30 +2012,39 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
-        if self.num_time_buckets > 0:
+        # ---- Temporal feature injection (coarse→fine) ----
+        # Slot order (time_reveal_k controls cutoff):
+        #   slot 0: time_bucket   slot 1: diff_week   slot 2: diff_day
+        #   slot 3: weekday       slot 4: diff_hour    slot 5: hour
+        # -1 / >=6 → all slots active (default / inference).
+        _all_time = (time_reveal_k < 0 or time_reveal_k >= 6)
+
+        # slot 0: time_bucket (coarsest relative bucket)
+        if self.num_time_buckets > 0 and (_all_time or time_reveal_k >= 1):
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
-        # Add temporal feature embeddings when enabled
         if self.use_temporal_features:
-            # Absolute-time features: apply dropout during training to improve generalisation
-            if seq_hour_ids is not None:
-                h_emb = self.seq_hour_emb(seq_hour_ids)
-                if self.training:
-                    h_emb = self.abs_time_dropout(h_emb)
-                token_emb = token_emb + h_emb
-            if seq_weekday_ids is not None:
+            # slot 1: diff_week
+            if seq_diff_week_ids is not None and (_all_time or time_reveal_k >= 2):
+                token_emb = token_emb + self.seq_diff_week_emb(seq_diff_week_ids)
+            # slot 2: diff_day
+            if seq_diff_day_ids is not None and (_all_time or time_reveal_k >= 3):
+                token_emb = token_emb + self.seq_diff_day_emb(seq_diff_day_ids)
+            # slot 3: weekday (absolute, coarser than hour)
+            if seq_weekday_ids is not None and (_all_time or time_reveal_k >= 4):
                 w_emb = self.seq_weekday_emb(seq_weekday_ids)
                 if self.training:
                     w_emb = self.abs_time_dropout(w_emb)
                 token_emb = token_emb + w_emb
-            # Relative-diff features: no extra dropout (more robust across time splits)
-            if seq_diff_hour_ids is not None:
+            # slot 4: diff_hour
+            if seq_diff_hour_ids is not None and (_all_time or time_reveal_k >= 5):
                 token_emb = token_emb + self.seq_diff_hour_emb(seq_diff_hour_ids)
-            if seq_diff_day_ids is not None:
-                token_emb = token_emb + self.seq_diff_day_emb(seq_diff_day_ids)
-            if seq_diff_week_ids is not None:
-                token_emb = token_emb + self.seq_diff_week_emb(seq_diff_week_ids)
+            # slot 5: hour (finest absolute time)
+            if seq_hour_ids is not None and _all_time:
+                h_emb = self.seq_hour_emb(seq_hour_ids)
+                if self.training:
+                    h_emb = self.abs_time_dropout(h_emb)
+                token_emb = token_emb + h_emb
 
         return token_emb
 
@@ -2027,6 +2056,36 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _query_diversity_loss(self, q_tokens_list: list) -> torch.Tensor:
+        """Compute query diversity regularisation loss (method B).
+
+        For each sequence domain, penalise the mean pairwise cosine similarity
+        between query slots.  A high similarity means queries have collapsed
+        to represent the same direction; minimising this loss pushes them apart.
+
+        Only active when num_queries > 1 and training=True.  Returns a scalar
+        tensor (device-matched to the first q tensor).
+
+        Formula (averaged over domains and pairs):
+            L_div = mean_{i} mean_{j≠k} |cosine_sim(Q_{i,j}, Q_{i,k})|
+        """
+        if self.num_queries <= 1:
+            return torch.tensor(0.0, device=q_tokens_list[0].device)
+
+        div_loss = torch.tensor(0.0, device=q_tokens_list[0].device)
+        count = 0
+        for q_i in q_tokens_list:            # q_i: (B, Nq, D)
+            # Normalise along D
+            q_norm = F.normalize(q_i, dim=-1)  # (B, Nq, D)
+            # Pairwise cosine similarity matrix: (B, Nq, Nq)
+            sim = torch.bmm(q_norm, q_norm.transpose(1, 2))
+            # Off-diagonal entries only
+            for j in range(self.num_queries):
+                for k in range(j + 1, self.num_queries):
+                    div_loss = div_loss + sim[:, j, k].abs().mean()
+                    count += 1
+        return div_loss / max(count, 1)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -2034,8 +2093,13 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list: list,
         seq_masks_list: list,
         apply_dropout: bool = True,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs the multi-sequence block stack with dropout and output projection.
+
+        Returns:
+            output:  (B, D) final representation.
+            div_loss: scalar query-diversity regularisation loss (zero when
+                      num_queries == 1 or apply_dropout is False / inference).
 
         Output = concat(all Q tokens, final NS tokens) -> Linear -> D
                + global_skip_proj(initial NS tokens flat)           [r5]
@@ -2097,7 +2161,14 @@ class PCVRHyFormer(nn.Module):
         # r5: global skip connection — add projected initial NS tokens
         output = output + self.global_skip_proj(ns_init_flat)  # (B, D)
 
-        return output
+        # Method B: query diversity regularisation (training only)
+        div_loss = (
+            self._query_diversity_loss(curr_qs)
+            if apply_dropout else
+            torch.tensor(0.0, device=output.device)
+        )
+
+        return output, div_loss
 
     def _build_ns_tokens(
         self,
@@ -2170,20 +2241,36 @@ class PCVRHyFormer(nn.Module):
         # --- Target (request) temporal token ---
         # concat(hour_emb, weekday_emb, week_of_year_emb) -> Linear(3D->D) -> 1 NS token
         # 绝对时间特征加 Dropout（泛化性：减少对特定时段的过拟合）
+        #
+        # DIG coarse-to-fine for NS temporal (fid_order mode):
+        #   Granularity order: week_of_year (coarsest) → weekday → hour (finest)
+        #   reveal_ratio < 1/3  : only week_of_year active; weekday & hour → zero
+        #   reveal_ratio < 2/3  : week_of_year + weekday active; hour → zero
+        #   reveal_ratio >= 2/3 : all three active (full signal)
         if self.use_temporal_features:
             B = inputs.user_int_feats.shape[0]
-            zeros = inputs.user_int_feats.new_zeros(B, self.d_model)
-            req_hour_e = self.req_hour_emb(inputs.req_hour) if inputs.req_hour is not None else zeros
-            req_weekday_e = self.req_weekday_emb(inputs.req_weekday) if inputs.req_weekday is not None else zeros
+            zeros = inputs.user_int_feats.new_zeros(B, self.d_model, dtype=torch.float)
+
+            use_weekday_ns = (self.sid_mode != 'fid_order') or (reveal_ratio >= 1.0 / 3)
+            use_hour_ns    = (self.sid_mode != 'fid_order') or (reveal_ratio >= 2.0 / 3)
+
             req_week_e = (
                 self.req_week_of_year_emb(inputs.req_week_of_year)
                 if inputs.req_week_of_year is not None else zeros
             )
+            req_weekday_e = (
+                self.req_weekday_emb(inputs.req_weekday)
+                if (inputs.req_weekday is not None and use_weekday_ns) else zeros
+            )
+            req_hour_e = (
+                self.req_hour_emb(inputs.req_hour)
+                if (inputs.req_hour is not None and use_hour_ns) else zeros
+            )
             # Apply dropout to absolute-time embeddings to improve generalisation
             if self.training:
-                req_hour_e = self.abs_time_dropout(req_hour_e)
+                req_week_e    = self.abs_time_dropout(req_week_e)
                 req_weekday_e = self.abs_time_dropout(req_weekday_e)
-                req_week_e = self.abs_time_dropout(req_week_e)
+                req_hour_e    = self.abs_time_dropout(req_hour_e)
             # (B, 3*D) -> Linear -> LayerNorm -> (B, D) -> (B, 1, D)
             req_time_cat = torch.cat([req_hour_e, req_weekday_e, req_week_e], dim=-1)  # (B, 3D)
             req_time_tok = F.silu(self.req_time_proj(req_time_cat)).unsqueeze(1)       # (B, 1, D)
@@ -2211,10 +2298,19 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list = []
         seq_masks_list = []
 
+        # In fid_order mode, temporal features are also revealed coarse→fine.
+        # There are 6 temporal slots: [time_bucket, diff_week, diff_day,
+        # weekday, diff_hour, hour].  We map reveal_ratio linearly onto
+        # [0, 6]: time_reveal_k = max(1, ceil(6 * reveal_ratio)).
+        # -1 means "all slots active" (used when sid_mode != 'fid_order').
+        time_reveal_k_val: int = -1
+        if self.sid_mode == 'fid_order' and reveal_ratio < 1.0:
+            time_reveal_k_val = max(1, math.ceil(6 * reveal_ratio))
+
         for domain in self.seq_domains:
             vs = self._seq_vocab_sizes[domain]
             S = len(vs)
-            # Compute reveal_k for this domain
+            # Compute reveal_k for sideinfo fids of this domain
             reveal_order: Optional[List[int]] = None
             reveal_k: int = -1
             if (self.sid_mode == 'fid_order'
@@ -2235,6 +2331,7 @@ class PCVRHyFormer(nn.Module):
                 seq_diff_week_ids=inputs.seq_diff_weeks.get(domain) if inputs.seq_diff_weeks else None,
                 reveal_order=reveal_order,
                 reveal_k=reveal_k,
+                time_reveal_k=time_reveal_k_val,
             )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -2266,24 +2363,26 @@ class PCVRHyFormer(nn.Module):
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
+        output, div_loss = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training,
         )
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
-        return logits
+        return logits, div_loss
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings.
 
         Always uses reveal_ratio=1.0 (full feature set).
+        div_loss is always zero at inference (apply_dropout=False) and is
+        discarded here.
         """
         ns_tokens = self._build_ns_tokens(inputs, reveal_ratio=1.0)
         seq_tokens_list, seq_masks_list = self._build_seq_tokens(inputs, reveal_ratio=1.0)
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
-        output = self._run_multi_seq_blocks(
+        output, _ = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False,
         )

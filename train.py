@@ -222,6 +222,12 @@ def parse_args() -> argparse.Namespace:
                              'Ignored when --sid_mode=none. '
                              'Larger values = stronger regularisation but higher compute. '
                              'Typical value: 4.')
+    parser.add_argument('--query_div_weight', type=float, default=0.01,
+                        help='Weight of the query diversity regularisation loss (method B). '
+                             'Penalises pairwise cosine similarity between Q tokens of the '
+                             'same sequence domain to prevent query collapse. '
+                             '0 = disabled. Only effective when --num_queries > 1. '
+                             'Typical value: 0.01.')
 
     args = parser.parse_args()
 
@@ -383,6 +389,7 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        query_div_weight=args.query_div_weight,
     )
 
     trainer.train()

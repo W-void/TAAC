@@ -102,6 +102,140 @@ ALL TESTS PASSED
 
 ---
 
+### r6 补充：时间特征也纳入 DIG 粗→细揭示
+
+#### 背景
+
+原始 r6 只对 sideinfo fid（user_int / item_int / seq_domain fid）做逐步揭示，时间特征始终以全量注入。但时间戳本身天然具备粒度层次（周 > 天 > 小时），应同样纳入 DIG 的粗→细流程。
+
+#### 实现
+
+**Seq 侧（`_embed_seq_domain`）**：
+
+新增 `time_reveal_k` 参数，将 6 个时间特征按粒度排成固定顺序，通过 `time_reveal_k` 控制截止位置：
+
+```
+slot 0: time_bucket  (相对时间桶，最粗)
+slot 1: diff_week    (相对时间差，周)
+slot 2: diff_day     (相对时间差，天)
+slot 3: weekday      (绝对星期，1-7)
+slot 4: diff_hour    (相对时间差，小时)
+slot 5: hour         (绝对小时，最细)
+```
+
+`_build_seq_tokens` 中根据 `reveal_ratio` 线性映射：
+```python
+time_reveal_k = max(1, ceil(6 * reveal_ratio))   # 1/K → 1 slot; K/K → 6 slots
+```
+
+**NS 侧（`_build_ns_tokens`）**：
+
+`req_time` token 保持为 1 个 NS token（`num_ns` 不变，T 约束不受影响），但内部的 3 个分量按粒度逐步揭示：
+
+```
+reveal_ratio < 1/3  : 只用 week_of_year（最粗）；weekday & hour → zero vector
+reveal_ratio < 2/3  : week_of_year + weekday；hour → zero vector
+reveal_ratio >= 2/3 : 全量（week_of_year + weekday + hour）
+```
+
+**修复**：`zeros = inputs.user_int_feats.new_zeros(B, d_model, dtype=torch.float)`，避免 Long/Float dtype 错误。
+
+#### 验证
+
+```
+ratio=0.167  time_slot=1/6  ns[week=✓ weekday=✗ hour=✗]  out=(4,1)   ✓
+ratio=0.333  time_slot=2/6  ns[week=✓ weekday=✓ hour=✗]  out=(4,1)   ✓
+ratio=0.500  time_slot=3/6  ns[week=✓ weekday=✓ hour=✗]  out=(4,1)   ✓
+ratio=0.667  time_slot=4/6  ns[week=✓ weekday=✓ hour=✓]  out=(4,1)   ✓
+ratio=0.833  time_slot=5/6  ns[week=✓ weekday=✓ hour=✓]  out=(4,1)   ✓
+ratio=1.000  time_slot=6/6  ns[week=✓ weekday=✓ hour=✓]  out=(4,1)   ✓
+none vs fid_order(ratio=1.0) max_diff = 0.00e+00                      ✓
+ratio=1/6 vs ratio=1.0 max_diff = 0.1737 (> 0, 验证屏蔽有效)          ✓
+ALL TIME-DIG TESTS PASSED
+```
+
+---
+
+### r7：Query Collapse 防护（方案 A + B）
+
+#### 背景与动机
+
+当 `num_queries > 1` 时，`DynamicQueryRefiner` 原实现使用单个 `Linear(D → Nq*D) + reshape` 生成多个 Q token。由于所有 Q slot 共享同一投影参数，梯度路径对称，模型缺乏结构性激励将不同 Q 特化到不同语义方向，容易出现**坍塌**（各 Q 趋于相同方向）。
+
+#### 实现
+
+**方案 A — 独立投影头（结构性防坍塌）**
+
+将 `q_projs` 从 1 个 `Linear(D → Nq*D)` 改为 `Nq` 个独立的 `Linear(D → D) + LayerNorm`：
+
+```python
+# 旧：共享投影
+q_flat = self.q_projs[i](ctx)           # (B, Nq*D)
+q_i = q_flat.view(B, Nq, D)
+
+# 新：独立投影
+qs = [proj(ctx) for proj in self.q_projs[i]]  # Nq × (B, D)
+q_i = torch.stack(qs, dim=1)                  # (B, Nq, D)
+```
+
+每个 Q slot 有自己独立的参数和梯度路径，结构上保证不同 slot 可朝不同方向分化。参数量相同（`Nq × D×D` vs `D × Nq*D`）。
+
+**方案 B — 多样性正则（辅助 Loss）**
+
+新增 `_query_diversity_loss`，惩罚各 Q token 之间的**成对余弦相似度**：
+
+```
+L_div = mean_{域i} mean_{j≠k} |cosine_sim(Q_{i,j}, Q_{i,k})|
+```
+
+- `_run_multi_seq_blocks` 训练时计算并返回 `(output, div_loss)`
+- `forward` 返回 `(logits, div_loss)`；`predict` 丢弃 div_loss（推理无影响）
+- `loss_total = task_loss + query_div_weight × div_loss`
+
+#### 新增参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--query_div_weight` | `0.01` | div_loss 权重；`0` = 关闭；仅 `num_queries > 1` 时有效 |
+
+#### 打印输出
+
+与主 loss 打印保持一致，三处同步：
+- **tqdm 进度条**：`loss=0.62  div=0.31  ...`
+- **TensorBoard**：新增 `Loss/train_div` 曲线
+- **epoch logging**：`Average Div Loss: 0.3124 (weighted: 0.0031)`
+
+#### 改动文件
+
+- `model.py`：`DynamicQueryRefiner.q_projs` 改为独立投影头；新增 `_query_diversity_loss`；`_run_multi_seq_blocks` / `forward` 返回值扩展为 `(output/logits, div_loss)`；`predict` 解包并丢弃 div_loss。
+- `train.py`：新增 `--query_div_weight` 参数；传给 trainer。
+- `trainer.py`：`__init__` 接收 `query_div_weight`；`_train_step` 叠加 div_loss；三处打印同步。
+
+---
+
+### 训练 loss 分粒度打印
+
+#### 背景
+
+DIG 模式（`sid_mode='fid_order'`）每个 step 运行 K 次 forward，之前仅打印 K 次的均值，无法观察不同揭示比例下的学习情况。
+
+#### 实现
+
+`_train_step` 返回值从 `float` 扩展为 `Tuple[float, Optional[list], float]`：
+
+```python
+return avg_loss, dig_losses, div_loss_val
+# dig_losses: List[float] 每个 reveal_ratio 的单独 loss；none 模式为 None
+# div_loss_val: query diversity loss（未加权原始值）
+```
+
+三处打印同步（与原 loss 格式一致）：
+- **tqdm 进度条**：`loss=0.62  div=0.31  r0.25=0.68  r0.50=0.61  r0.75=0.60  r1.00=0.59`
+- **TensorBoard**：`Loss/train_dig_r0.25` 等独立曲线；`Loss/train_div`
+- **epoch logging**：`DIG Average Loss: r0.25=0.68 | r0.50=0.61 | r0.75=0.60 | r1.00=0.59`
+
+---
+
 ## 2026-05-19
 
 ### 五项 UniRec 架构增强（r1–r5）

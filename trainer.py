@@ -58,6 +58,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        query_div_weight: float = 0.01,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +108,12 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.query_div_weight: float = query_div_weight
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"query_div_weight={query_div_weight}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -299,16 +302,45 @@ class PCVRHyFormerRankingTrainer:
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
+            div_loss_sum = 0.0
+            # Per-reveal-ratio accumulators for DIG mode (filled lazily)
+            dig_loss_sums: Optional[list] = None
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
+                loss, dig_losses, div_loss_val = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
+                div_loss_sum += div_loss_val
 
+                # --- TensorBoard ---
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    if self.query_div_weight > 0:
+                        self.writer.add_scalar('Loss/train_div', div_loss_val, total_step)
+                    if dig_losses is not None:
+                        K = len(dig_losses)
+                        for k, dl in enumerate(dig_losses):
+                            ratio = (k + 1) / K
+                            self.writer.add_scalar(
+                                f'Loss/train_dig_r{ratio:.2f}', dl, total_step)
 
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                # --- tqdm postfix ---
+                postfix: Dict[str, str] = {"loss": f"{loss:.4f}"}
+                if self.query_div_weight > 0:
+                    postfix["div"] = f"{div_loss_val:.4f}"
+                if dig_losses is not None:
+                    K = len(dig_losses)
+                    for k, dl in enumerate(dig_losses):
+                        ratio = (k + 1) / K
+                        postfix[f"r{ratio:.2f}"] = f"{dl:.4f}"
+                train_pbar.set_postfix(postfix)
+
+                # --- DIG per-ratio accumulator ---
+                if dig_losses is not None:
+                    if dig_loss_sums is None:
+                        dig_loss_sums = [0.0] * len(dig_losses)
+                    for k, dl in enumerate(dig_losses):
+                        dig_loss_sums[k] += dl
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -329,7 +361,18 @@ class PCVRHyFormerRankingTrainer:
                         logging.info(f"Early stopping at step {total_step}")
                         return
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            n_steps = len(self.train_loader)
+            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / n_steps}")
+            if self.query_div_weight > 0:
+                logging.info(f"Epoch {epoch}, Average Div Loss: {div_loss_sum / n_steps:.4f} "
+                             f"(weighted: {self.query_div_weight * div_loss_sum / n_steps:.4f})")
+            if dig_loss_sums is not None:
+                K = len(dig_loss_sums)
+                parts = " | ".join(
+                    f"r{(k+1)/K:.2f}={dig_loss_sums[k]/n_steps:.4f}"
+                    for k in range(K)
+                )
+                logging.info(f"Epoch {epoch}, DIG Average Loss: {parts}")
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
@@ -429,8 +472,13 @@ class PCVRHyFormerRankingTrainer:
             return sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         return F.binary_cross_entropy_with_logits(logits, label)
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value.
+    def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, Optional[list], float]:
+        """Run a single training step and return ``(avg_loss, dig_losses, div_loss)``.
+
+        ``dig_losses`` is a list of per-reveal-ratio task losses when
+        sid_mode='fid_order', otherwise ``None``.
+        ``div_loss`` is the scalar query diversity regularisation loss value
+        (before weighting); 0.0 when query_div_weight == 0 or num_queries <= 1.
 
         r6 (sid_mode='fid_order'): runs dig_steps forward passes with
         reveal_ratio = 1/K, 2/K, …, 1.  The final loss is the mean over
@@ -452,21 +500,30 @@ class PCVRHyFormerRankingTrainer:
             and self.model.sid_mode == 'fid_order'
         )
 
+        dig_losses: Optional[list] = None
+        div_loss_tensor = torch.tensor(0.0, device=self.device)
         if use_dig:
             # DIG training: multiple forward passes with increasing reveal_ratio.
             # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
             K = self.model.dig_steps
             loss_sum = torch.tensor(0.0, device=self.device)
+            dig_losses = []
             for step_idx in range(K):
                 reveal_ratio = (step_idx + 1) / K
-                logits = self.model(model_input, reveal_ratio=reveal_ratio)
+                logits, div_loss_tensor = self.model(model_input, reveal_ratio=reveal_ratio)
                 logits = logits.squeeze(-1)
-                loss_sum = loss_sum + self._compute_loss(logits, label)
+                step_loss = self._compute_loss(logits, label)
+                loss_sum = loss_sum + step_loss
+                dig_losses.append(step_loss.item())
             loss = loss_sum / K
         else:
-            logits = self.model(model_input)  # (B, 1)
+            logits, div_loss_tensor = self.model(model_input)  # (B, 1), scalar
             logits = logits.squeeze(-1)  # (B,)
             loss = self._compute_loss(logits, label)
+
+        # Add query diversity regularisation loss (method B)
+        if self.query_div_weight > 0:
+            loss = loss + self.query_div_weight * div_loss_tensor
 
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
@@ -477,7 +534,7 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
-        return loss.item()
+        return loss.item(), dig_losses, div_loss_tensor.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
