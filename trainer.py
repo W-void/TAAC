@@ -562,23 +562,35 @@ class PCVRHyFormerRankingTrainer:
             K = self.model.dig_steps
 
             if self.dig_mode == 'random':
-                # Random single-step DIG: sample one reveal_ratio uniformly from
-                # {1/K, 2/K, ..., 1}.  Speed = 1× forward (same as no DIG);
-                # over many batches all K granularities are covered on average.
-                # reveal_ratio=1.0 always included in expectation (prob=1/K);
-                # div_loss applied only when the full-feature step is sampled.
-                step_idx = int(torch.randint(K, (1,)).item())
-                reveal_ratio = (step_idx + 1) / K
-                logits, step_div_loss = self.model(model_input, reveal_ratio=reveal_ratio)
+                # Random+Full DIG: always run reveal_ratio=1.0 (full-feature, main
+                # task), then randomly sample ONE coarse step from {1/K,...,(K-1)/K}
+                # as a regularisation auxiliary loss.
+                # Total cost = 2 forward passes (vs K in 'all' mode).
+                # The full-feature step is the anchor; the coarse step prevents
+                # the model from ignoring low-granularity representations.
+                # Both steps call backward() immediately to release activation graphs.
+
+                # --- Step 1: full-feature forward (always) ---
+                logits, step_div_loss = self.model(model_input, reveal_ratio=1.0)
                 logits = logits.squeeze(-1)
-                step_loss = self._compute_loss(logits, label)
-                if step_idx == K - 1:  # full-feature step
-                    div_loss_tensor = step_div_loss
-                    if self.query_div_weight > 0:
-                        step_loss = step_loss + self.query_div_weight * step_div_loss
-                step_loss.backward()
-                dig_losses = [step_loss.item()]
-                loss = step_loss.item()
+                full_loss = self._compute_loss(logits, label)
+                div_loss_tensor = step_div_loss
+                if self.query_div_weight > 0:
+                    full_loss = full_loss + self.query_div_weight * step_div_loss
+                full_loss.backward()
+
+                # --- Step 2: one random coarse step from {1/K,...,(K-1)/K} ---
+                coarse_idx = int(torch.randint(K - 1, (1,)).item())  # 0..K-2
+                coarse_ratio = (coarse_idx + 1) / K
+                logits_c, _ = self.model(model_input, reveal_ratio=coarse_ratio)
+                logits_c = logits_c.squeeze(-1)
+                coarse_loss = self._compute_loss(logits_c, label)
+                # Weight coarse loss relative to full loss (half weight to keep
+                # the main task dominant)
+                (0.5 * coarse_loss).backward()
+
+                dig_losses = [full_loss.item(), coarse_loss.item()]
+                loss = full_loss.item()
             else:
                 # DIG training: multiple forward passes with increasing reveal_ratio.
                 # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
