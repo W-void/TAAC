@@ -222,6 +222,13 @@ def parse_args() -> argparse.Namespace:
                              'Ignored when --sid_mode=none. '
                              'Larger values = stronger regularisation but higher compute. '
                              'Typical value: 4.')
+    parser.add_argument('--dig_mode', type=str, default='all',
+                        choices=['all', 'random'],
+                        help='DIG step selection mode (only effective when --sid_mode=fid_order). '
+                             'all    = run all K steps per batch (original, K× compute). '
+                             'random = sample 1 step uniformly from {1/K,...,1} per batch '
+                             '         (1× compute, same speed as no DIG; '
+                             '         all K granularities covered on average over batches).')
     parser.add_argument('--query_div_weight', type=float, default=0.01,
                         help='Weight of the query diversity regularisation loss (method B). '
                              'Penalises pairwise cosine similarity between Q tokens of the '
@@ -395,6 +402,7 @@ def main() -> None:
         train_config=vars(args),
         query_div_weight=args.query_div_weight,
         ema_decay=args.ema_decay,
+        dig_mode=args.dig_mode,
     )
 
     trainer.train()

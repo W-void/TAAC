@@ -105,6 +105,7 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         query_div_weight: float = 0.01,
         ema_decay: float = 0.999,
+        dig_mode: str = 'all',
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -155,6 +156,9 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.query_div_weight: float = query_div_weight
+        assert dig_mode in ('all', 'random'), \
+            f"dig_mode must be 'all' or 'random', got {dig_mode!r}"
+        self.dig_mode: str = dig_mode
 
         # EMA
         self.ema: Optional[ModelEMA] = None
@@ -555,46 +559,66 @@ class PCVRHyFormerRankingTrainer:
         dig_losses: Optional[list] = None
         div_loss_tensor = torch.tensor(0.0, device=self.device)
         if use_dig:
-            # DIG training: multiple forward passes with increasing reveal_ratio.
-            # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
-            #
-            # Loss weighting: linearly increasing weights so that the full-feature
-            # step contributes more than coarse-only steps.  Fine-grained fids
-            # (high vocab_size) only appear in later steps, so upweighting them
-            # compensates for the asymmetric training frequency.
-            #   weights[i] = (i+1) / sum(1..K) = (i+1) / (K*(K+1)/2)
-            #
-            # div_loss is only added at the last step (reveal_ratio=1.0): at
-            # coarse steps the Q tokens are mostly zeroed-out, so pairwise
-            # cosine similarity is spuriously high and would inject noisy
-            # gradients into the query projection parameters.
-            #
-            # Memory-efficient gradient accumulation: each sub-step calls
-            # loss.backward() immediately so only ONE forward pass graph is
-            # live in GPU memory at a time (instead of K graphs all kept until
-            # the final backward).  Optimizer step is deferred to after the loop.
             K = self.model.dig_steps
-            weight_sum = K * (K + 1) / 2  # sum of 1..K
-            dig_losses = []
-            total_loss_val = 0.0
-            for step_idx in range(K):
+
+            if self.dig_mode == 'random':
+                # Random single-step DIG: sample one reveal_ratio uniformly from
+                # {1/K, 2/K, ..., 1}.  Speed = 1× forward (same as no DIG);
+                # over many batches all K granularities are covered on average.
+                # reveal_ratio=1.0 always included in expectation (prob=1/K);
+                # div_loss applied only when the full-feature step is sampled.
+                step_idx = int(torch.randint(K, (1,)).item())
                 reveal_ratio = (step_idx + 1) / K
-                step_weight = (step_idx + 1) / weight_sum  # linearly increasing
                 logits, step_div_loss = self.model(model_input, reveal_ratio=reveal_ratio)
                 logits = logits.squeeze(-1)
                 step_loss = self._compute_loss(logits, label)
-                # Accumulate div_loss only from the last (full-feature) step
-                if step_idx == K - 1:
+                if step_idx == K - 1:  # full-feature step
                     div_loss_tensor = step_div_loss
                     if self.query_div_weight > 0:
                         step_loss = step_loss + self.query_div_weight * step_div_loss
-                weighted = step_weight * step_loss
-                # backward immediately to free this step's activation graph;
-                # retain_graph=False (default) drops the graph right away.
-                weighted.backward()
-                total_loss_val += weighted.item()
-                dig_losses.append(step_loss.item())
-            loss = total_loss_val  # scalar float, used only for logging
+                step_loss.backward()
+                dig_losses = [step_loss.item()]
+                loss = step_loss.item()
+            else:
+                # DIG training: multiple forward passes with increasing reveal_ratio.
+                # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
+                #
+                # Loss weighting: linearly increasing weights so that the full-feature
+                # step contributes more than coarse-only steps.  Fine-grained fids
+                # (high vocab_size) only appear in later steps, so upweighting them
+                # compensates for the asymmetric training frequency.
+                #   weights[i] = (i+1) / sum(1..K) = (i+1) / (K*(K+1)/2)
+                #
+                # div_loss is only added at the last step (reveal_ratio=1.0): at
+                # coarse steps the Q tokens are mostly zeroed-out, so pairwise
+                # cosine similarity is spuriously high and would inject noisy
+                # gradients into the query projection parameters.
+                #
+                # Memory-efficient gradient accumulation: each sub-step calls
+                # loss.backward() immediately so only ONE forward pass graph is
+                # live in GPU memory at a time (instead of K graphs all kept until
+                # the final backward).  Optimizer step is deferred to after the loop.
+                weight_sum = K * (K + 1) / 2  # sum of 1..K
+                dig_losses = []
+                total_loss_val = 0.0
+                for step_idx in range(K):
+                    reveal_ratio = (step_idx + 1) / K
+                    step_weight = (step_idx + 1) / weight_sum  # linearly increasing
+                    logits, step_div_loss = self.model(model_input, reveal_ratio=reveal_ratio)
+                    logits = logits.squeeze(-1)
+                    step_loss = self._compute_loss(logits, label)
+                    # Accumulate div_loss only from the last (full-feature) step
+                    if step_idx == K - 1:
+                        div_loss_tensor = step_div_loss
+                        if self.query_div_weight > 0:
+                            step_loss = step_loss + self.query_div_weight * step_div_loss
+                    weighted = step_weight * step_loss
+                    # backward immediately to free this step's activation graph;
+                    # retain_graph=False (default) drops the graph right away.
+                    weighted.backward()
+                    total_loss_val += weighted.item()
+                    dig_losses.append(step_loss.item())
+                loss = total_loss_val  # scalar float, used only for logging
         else:
             logits, div_loss_tensor = self.model(model_input)  # (B, 1), scalar
             logits = logits.squeeze(-1)  # (B,)

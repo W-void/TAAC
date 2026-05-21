@@ -24,6 +24,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --sid_mode fid_order \
     --dig_steps 4 \
+    --dig_mode random \
     --csa_top_k 50 \
     --num_workers 8 \
     "$@"
