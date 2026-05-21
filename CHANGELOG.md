@@ -1,6 +1,62 @@
 # TAAC 改动记录
 ---
 
+## 2026-05-21 (r8.2)
+
+### r8.2：`dig_mode=random` 修正——reveal_ratio=1.0 每次必跑
+
+#### 背景
+
+r8.1 的 `random` 模式从 `{1/K,...,1}` 均匀采样，导致 `reveal_ratio=1.0`（完整链路）只有 1/K=25% 的概率出现，大多数 batch 用残缺特征训练，主任务收敛受损。
+
+#### 实现
+
+```
+每个 batch（dig_mode=random）：
+  Step 1（必跑）: reveal_ratio=1.0，全特征主任务，weight=1.0 → backward()
+  Step 2（随机）: reveal_ratio ∈ {1/K,...,(K-1)/K} 随机采一步，weight=0.5 → backward()
+  → optimizer.step()
+```
+
+- 主任务每次都有完整梯度，收敛不受影响
+- 粗粒度正则每步以 0.5 权重附加，不压制主信号
+- 代价 = 2× forward（介于 `none` 的 1× 和 `all` 的 4× 之间）
+
+---
+
+## 2026-05-21 (r8.1)
+
+### r8.1：DIG 显存修复——梯度累积替代计算图累积 + dig_mode=random
+
+#### 背景（OOM 原因）
+
+原 DIG 实现将 K=4 次 forward 的计算图全部挂在 `loss_sum` 上，最后统一 `backward()`，GPU 需同时保留 **4 份激活值**。配合 r8 将 `d_model` 从 64→114（参数量约 3×），实际显存压力约为改前的 **12×**，触发 OOM。
+
+#### 改动 A — `trainer.py`：梯度累积（`dig_mode=all`）
+
+```python
+# 旧：K 份计算图同时存活
+for i in range(K):
+    loss_sum = loss_sum + weight * step_loss   # 图不释放
+loss_sum.backward()                            # 最后才释放
+
+# 新：每步立即释放
+for i in range(K):
+    weighted.backward()   # 图立即释放，显存 1× 而非 K×
+optimizer.step()          # 循环外执行，梯度自然累加，数学等价
+```
+
+#### 改动 B — `trainer.py` + `train.py` + `run.sh`：新增 `dig_mode` 参数
+
+| 值 | 行为 | forward 次数 |
+|----|------|-------------|
+| `all` | 原有全 K 步（梯度累积） | K× |
+| `random` | 全特征步必跑 + 随机 1 步粗粒度 | 2× |
+
+`run.sh` 默认设为 `--dig_mode random`。
+
+---
+
 ## 2026-05-21 (r8)
 
 ### r8：EMA + item GroupNS 精细分组 + sample_ts_gate
