@@ -505,17 +505,33 @@ class PCVRHyFormerRankingTrainer:
         if use_dig:
             # DIG training: multiple forward passes with increasing reveal_ratio.
             # reveal_ratios = [1/K, 2/K, ..., K/K=1.0]
+            #
+            # Loss weighting: linearly increasing weights so that the full-feature
+            # step contributes more than coarse-only steps.  Fine-grained fids
+            # (high vocab_size) only appear in later steps, so upweighting them
+            # compensates for the asymmetric training frequency.
+            #   weights[i] = (i+1) / sum(1..K) = (i+1) / (K*(K+1)/2)
+            #
+            # div_loss is only added at the last step (reveal_ratio=1.0): at
+            # coarse steps the Q tokens are mostly zeroed-out, so pairwise
+            # cosine similarity is spuriously high and would inject noisy
+            # gradients into the query projection parameters.
             K = self.model.dig_steps
+            weight_sum = K * (K + 1) / 2  # sum of 1..K
             loss_sum = torch.tensor(0.0, device=self.device)
             dig_losses = []
             for step_idx in range(K):
                 reveal_ratio = (step_idx + 1) / K
-                logits, div_loss_tensor = self.model(model_input, reveal_ratio=reveal_ratio)
+                step_weight = (step_idx + 1) / weight_sum  # linearly increasing
+                logits, step_div_loss = self.model(model_input, reveal_ratio=reveal_ratio)
                 logits = logits.squeeze(-1)
                 step_loss = self._compute_loss(logits, label)
-                loss_sum = loss_sum + step_loss
+                loss_sum = loss_sum + step_weight * step_loss
+                # Accumulate div_loss only from the last (full-feature) step
+                if step_idx == K - 1:
+                    div_loss_tensor = step_div_loss
                 dig_losses.append(step_loss.item())
-            loss = loss_sum / K
+            loss = loss_sum  # already weighted, no need to divide by K
         else:
             logits, div_loss_tensor = self.model(model_input)  # (B, 1), scalar
             logits = logits.squeeze(-1)  # (B,)

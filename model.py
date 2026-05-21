@@ -1085,6 +1085,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        reveal_ratio: float = 1.0,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -1095,6 +1096,10 @@ class MultiSeqHyFormerBlock(nn.Module):
             seq_padding_masks: List of (B, L_i) masks, length S.
             rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
             rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            reveal_ratio: Fraction of fids currently revealed (0 < ratio <= 1).
+                Used to gate CSA: when reveal_ratio < 0.75 many NS/seq fids are
+                zeroed out, making Q unreliable for dot-product ranking, so CSA
+                is disabled to avoid injecting noisy attention masks.
 
         Returns:
             A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
@@ -1135,8 +1140,13 @@ class MultiSeqHyFormerBlock(nn.Module):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
 
-            # r2: CSA — build top-k mask if enabled and not protect_seq block
-            if self.csa_top_k > 0 and not self.protect_seq:
+            # r2: CSA — build top-k mask if enabled, not protect_seq block, and
+            # reveal_ratio is high enough for Q to be reliable.
+            # When reveal_ratio < 0.75 (DIG coarse steps), many fids are zeroed
+            # out so Q·seq_K similarity is dominated by noise; using that to rank
+            # seq tokens would produce random (or harmful) sparse masks.
+            csa_q_reliable = reveal_ratio >= 0.75
+            if self.csa_top_k > 0 and not self.protect_seq and csa_q_reliable:
                 csa_mask = self._csa_mask(
                     q_tokens_list[i], next_seqs[i], next_masks[i],
                     top_k=self.csa_top_k,
@@ -2093,6 +2103,7 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list: list,
         seq_masks_list: list,
         apply_dropout: bool = True,
+        reveal_ratio: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs the multi-sequence block stack with dropout and output projection.
 
@@ -2110,9 +2121,13 @@ class PCVRHyFormer(nn.Module):
 
         r6 (sid_mode='fid_order'): The seq tokens and NS tokens fed into this
         method are already built with the desired reveal_ratio (zero-ed out fids
-        for masked features).  No per-block scheduling is performed here; the
-        coarse-to-fine effect is achieved at the training step level by calling
-        forward() multiple times with increasing reveal_ratio values.
+        for masked features).  reveal_ratio is forwarded to each block so that
+        CSA can be disabled when Q quality is low (reveal_ratio < 0.75).
+
+        div_loss is only computed at reveal_ratio=1.0 (full-feature step).
+        At coarse DIG steps the Q tokens are largely zeroed-out projections,
+        causing spuriously high pairwise cosine similarity and noisy gradients
+        in the query projection parameters.
         """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
@@ -2149,6 +2164,7 @@ class PCVRHyFormer(nn.Module):
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                reveal_ratio=reveal_ratio,
             )
 
         # Output: Q tokens (carry sequence-conditioned info) +
@@ -2161,10 +2177,15 @@ class PCVRHyFormer(nn.Module):
         # r5: global skip connection — add projected initial NS tokens
         output = output + self.global_skip_proj(ns_init_flat)  # (B, D)
 
-        # Method B: query diversity regularisation (training only)
+        # Method B: query diversity regularisation (training only).
+        # Only computed at the full-feature step (reveal_ratio=1.0): at coarse
+        # DIG steps Q vectors are dominated by zeroed-out fid projections,
+        # making pairwise cosine similarity spuriously high and injecting noisy
+        # gradients into the query projection parameters.
+        full_feature_step = (reveal_ratio >= 1.0)
         div_loss = (
             self._query_diversity_loss(curr_qs)
-            if apply_dropout else
+            if apply_dropout and full_feature_step else
             torch.tensor(0.0, device=output.device)
         )
 
@@ -2366,6 +2387,7 @@ class PCVRHyFormer(nn.Module):
         output, div_loss = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training,
+            reveal_ratio=reveal_ratio,
         )
 
         # 5. Classifier

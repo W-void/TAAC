@@ -1,6 +1,53 @@
 # TAAC 改动记录
 ---
 
+## 2026-05-20 (r7)
+
+### r7：DIG 训练三项优化
+
+#### 背景
+
+r6 引入了 DIG 训练范式（多步 forward + reveal_ratio 从粗到细），但存在以下问题：
+
+1. **Loss 权重平均不合理**：K 个 step 均等权重意味着粗粒度 step（低信息量）与细粒度 step（全特征）贡献相同，导致梯度偏向"用少量特征就能预测"的方向，浪费细粒度 step 的监督信号。
+2. **div_loss 在粗粒度步噪声高**：reveal_ratio 较小时大量 fid embedding 被置零，Q token 主要来自零向量投影，pairwise cosine 偏高，div_loss 会向 query projection 注入虚假的"多样化"梯度。
+3. **CSA 在粗粒度步不可靠**：reveal_ratio < 0.75 时 NS 特征稀疏，DynamicQueryRefiner 生成的 Q 质量差，用 Q·K^T top-k 稀疏化 attention mask 相当于随机剪枝，可能伤害 seq encoding。
+
+#### 实现
+
+**改动 A — trainer.py：DIG loss 线性递增加权**
+
+```
+weights[i] = (i+1) / (K*(K+1)/2)   # 线性递增，最后一步权重最大
+loss = Σ weights[i] * step_loss[i]  # 已归一化，不再除以 K
+```
+
+例 K=4：weights = [0.1, 0.2, 0.3, 0.4]，全特征 step 权重是粗粒度 step 的 4 倍。
+
+**改动 B — trainer.py：div_loss 只在最后一步累积**
+
+```python
+if step_idx == K - 1:
+    div_loss_tensor = step_div_loss   # 只取 reveal_ratio=1.0 的 div_loss
+```
+
+**改动 C — model.py：`_run_multi_seq_blocks` + `MultiSeqHyFormerBlock.forward`**
+
+- `_run_multi_seq_blocks` 新增 `reveal_ratio: float = 1.0` 参数，透传给每个 Block。
+- `_run_multi_seq_blocks` 中 div_loss 计算门控：`reveal_ratio < 1.0` 时返回零张量。
+- `MultiSeqHyFormerBlock.forward` 新增 `reveal_ratio` 参数，当 `reveal_ratio < 0.75` 时 CSA 退化为普通 padding mask（`csa_q_reliable = reveal_ratio >= 0.75`）。
+- `PCVRHyFormer.forward` 将 `reveal_ratio` 传入 `_run_multi_seq_blocks`。
+
+#### 影响
+
+| 指标 | 预期方向 |
+|------|---------|
+| 细粒度 step 的梯度幅度 | ↑（相对权重提升） |
+| div_loss 梯度噪声 | ↓（粗粒度步不再更新 query projection 的 orthogonal 方向） |
+| 粗粒度步 CSA 引入的 attention mask 错误率 | ↓（直接禁用，退回全序列 attention） |
+
+---
+
 ## 2026-05-20
 
 ### r6：DIG-style 全特征组逐步恢复（`sid_mode='fid_order'`）
