@@ -4,7 +4,7 @@
   "_usage": "train.py loads this file (path given by --ns_groups_json, default ./ns_groups.json) and converts fids into positional indices of the schema entries at runtime. If the file is missing, each feature is placed in its own singleton group.",
 
   "_comment": "NS token groups for parquet data. Values are fids (the numeric suffix in column names, e.g. user_int_feats_{fid}); train.py converts them to schema entry indices at load time.",
-  "_note_T": "T = num_queries * num_sequences + num_ns = 1*4 + (7+1+4) = 16. num_sequences=4 (seq_a/b/c/d). num_ns = 7 user_int groups + 1 user_dense token + 4 item_int groups = 12. d_model must be divisible by 16 (e.g. 64).",
+  "_note_T": "T = num_queries * num_sequences + num_ns = 1*4 + (7+1+6+1) = 19. num_sequences=4 (seq_a/b/c/d). num_ns = 7 user_int groups + 1 user_dense token + 6 item_int groups (fid=16/13/81 each get their own token) + 1 temporal = 15. d_model must be divisible by 19 (e.g. 114=19*6). Reference: EXP-061 (+0.0121 AUC).",
   "_note_user_dense": "All user dense features (fid 61/62/63/64/65/66/87/89/90/91, total_dim=918) are concatenated and projected to a single NS token. Not configured here.",
   "_note_shared_fids": "Fids 62/63/64/65/66/89/90/91 appear in both user_int_feats and user_dense_feats. The int and float parts jointly describe the same underlying signal. The int parts are grouped via GroupNSTokenizer below; the float parts are included in the single user_dense NS token.",
 
@@ -19,9 +19,11 @@
   },
 
   "item_ns_groups": {
-    "I1": [11, 13],
-    "I2": [5, 6, 7, 8, 12],
-    "I3": [16, 81, 83, 84, 85],
-    "I4": [9, 10]
+    "I1": [11],
+    "I2": [13],
+    "I3": [16],
+    "I4": [5, 6, 7, 8, 12],
+    "I5": [81, 83, 84, 85],
+    "I6": [9, 10]
   }
 }

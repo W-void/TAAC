@@ -1,6 +1,70 @@
 # TAAC 改动记录
 ---
 
+## 2026-05-21 (r8)
+
+### r8：EMA + item GroupNS 精细分组 + sample_ts_gate
+
+#### 背景与动机
+
+借鉴队友 `claude-code-iter-v3` 分支实验台账中 AUC 最高的三项改进：
+
+| 改进 | 参考实验 | 对方收益 |
+|------|---------|---------|
+| EMA(0.999) | EXP-051 | +0.0103 |
+| item GroupNS：fid=16/13/81 独立 token | EXP-061 | +0.0121（最高） |
+| sample_ts_gate：tanh gate 广播请求时间 | EXP-054 | +0.0108 |
+
+---
+
+#### 改动 A — `trainer.py` + `train.py`：EMA（指数移动平均）
+
+新增 `ModelEMA` 类，维护模型参数的 shadow 副本（存在 CPU，节省显存）：
+
+```
+ema_param = decay * ema_param + (1 - decay) * param   # decay=0.999
+```
+
+- **训练阶段**：每个 optimizer step 后调用 `ema.update()`，更新 shadow 参数。
+- **验证阶段**：`evaluate()` 开始前 `ema.apply()` 换入 EMA 权重，结束后 `ema.restore()` 换回，对训练流程零侵入。
+- `train.py` 新增 `--ema_decay`（默认 0.999），透传给 Trainer；设 `0` 可完全禁用。
+
+#### 改动 B — `ns_groups.json` + `run.sh`：item GroupNS 精细分组
+
+**`ns_groups.json`**：item 分组从 4 组扩展到 **6 组**，将 fid=11、fid=13、fid=16 各自独立：
+
+```
+旧（4 组）：I1=[11,13]  I2=[5,6,7,8,12]  I3=[16,81,83,84,85]  I4=[9,10]
+新（6 组）：I1=[11]  I2=[13]  I3=[16]  I4=[5,6,7,8,12]  I5=[81,83,84,85]  I6=[9,10]
+```
+
+fid=13/16/81 是 item 侧区分度最高的 ID 类特征，独立成 token 让模型可以对其单独建模，避免被稀释。
+
+**`run.sh`**：切换到 `--ns_tokenizer_type group`，并据此调整超参以满足 `d_model % T == 0`：
+
+```
+T = num_queries(1) * num_sequences(4) + num_ns(15) = 19
+num_ns = user_ns(7) + user_dense(1) + item_ns(6) + temporal(1) = 15
+d_model = 114  (114 / 19 = 6 ✓)
+num_heads = 6  (head_dim = 114 / 6 = 19)
+```
+
+#### 改动 C — `model.py`：sample_ts_gate
+
+在 `_build_ns_tokens` 末尾，用请求时间 token（`req_time_tok`）生成一个 **tanh gate**，广播乘以全部 NS tokens：
+
+```python
+gate = tanh(Linear(d_model -> d_model)(req_time_tok))  # (B, 1, D)，零初始化
+ns_tokens = ns_tokens * (1.0 + gate)                   # 残差乘法，广播到所有 NS
+```
+
+设计要点：
+- **零初始化**：`gate_proj` 的 weight 和 bias 均初始化为 0，使训练初期 gate=tanh(0)=0，不破坏已收敛方向。
+- **残差乘法** `1 + gate`：gate=0 时恒等变换，训练稳定；gate≠0 时对各 NS token 施加时间相关的幅度调制。
+- 参数开销：仅 +1 个 `Linear(d_model, d_model)`（约 d_model² 个参数）。
+
+---
+
 ## 2026-05-20 (r7)
 
 ### r7：DIG 训练三项优化

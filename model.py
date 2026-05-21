@@ -1750,6 +1750,14 @@ class PCVRHyFormer(nn.Module):
             self.seq_diff_week_emb = nn.Embedding(NUM_WEEK_DIFF_BUCKETS, d_model, padding_idx=0)
             # Dropout for absolute-time embeddings (泛化性：绝对时间特征比相对时间差更容易过拟合时间分布)
             self.abs_time_dropout = nn.Dropout(p=min(dropout_rate * 5, 0.2))
+            # sample_ts_gate: tanh-gate that broadcasts request-time context to all NS tokens
+            # A single Linear(d_model -> d_model) projects req_time_tok to a gate vector;
+            # gate = tanh(proj(req_time)) is then multiplied element-wise with every NS token.
+            # Only +1 Linear layer (~d_model^2 params), yet provides a global time-aware
+            # modulation of all NS tokens. Ref: EXP-054 (+0.0108 AUC).
+            self.sample_ts_gate_proj = nn.Linear(d_model, d_model)
+            nn.init.zeros_(self.sample_ts_gate_proj.weight)
+            nn.init.zeros_(self.sample_ts_gate_proj.bias)
 
         # ================== Mixed Parameterization: per-source NS FFN ==================
         # OneTrans style: different NS token sources have independent FFNs so that
@@ -2298,7 +2306,17 @@ class PCVRHyFormer(nn.Module):
             req_time_tok = req_time_tok + self.temporal_ns_ffn(req_time_tok)           # residual FFN
             ns_parts.append(req_time_tok)
 
-        return torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+
+        # sample_ts_gate: broadcast request-time context to all NS tokens via tanh gate.
+        # gate = tanh(Linear(req_time_tok)) shape (B, 1, D); multiply with every NS token.
+        # Zero-init keeps gate=tanh(0)=0 at the start so the model trains stably.
+        # Only active when temporal features are enabled (req_time_tok is available).
+        if self.use_temporal_features:
+            gate = torch.tanh(self.sample_ts_gate_proj(req_time_tok))  # (B, 1, D)
+            ns_tokens = ns_tokens * (1.0 + gate)                       # broadcast residual
+
+        return ns_tokens  # (B, num_ns, D)
 
     def _build_seq_tokens(
         self,

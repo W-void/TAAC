@@ -22,6 +22,51 @@ from utils import sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
 
 
+class ModelEMA:
+    """Exponential Moving Average of model parameters.
+
+    Maintains a shadow copy of the model weights updated as:
+        ema_param = decay * ema_param + (1 - decay) * param
+
+    Usage: call ``update()`` after each optimizer step; use ``apply()`` /
+    ``restore()`` around evaluation to temporarily swap in EMA weights.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        # Store EMA shadow params on CPU to save GPU memory
+        self.shadow: Dict[str, torch.Tensor] = {
+            name: param.data.clone().cpu()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        self._backup: Dict[str, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Update shadow parameters after an optimizer step."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data.cpu() * (1.0 - self.decay)
+                )
+
+    def apply(self, model: nn.Module) -> None:
+        """Swap in EMA weights for evaluation."""
+        self._backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self._backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name].to(param.device))
+
+    def restore(self, model: nn.Module) -> None:
+        """Restore original weights after evaluation."""
+        for name, param in model.named_parameters():
+            if name in self._backup:
+                param.data.copy_(self._backup[name])
+        self._backup = {}
+
+
 class PCVRHyFormerRankingTrainer:
     """PCVRHyFormer trainer for pointwise binary classification.
 
@@ -59,6 +104,7 @@ class PCVRHyFormerRankingTrainer:
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
         query_div_weight: float = 0.01,
+        ema_decay: float = 0.999,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -109,6 +155,12 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.query_div_weight: float = query_div_weight
+
+        # EMA
+        self.ema: Optional[ModelEMA] = None
+        if ema_decay > 0.0:
+            self.ema = ModelEMA(model, decay=ema_decay)
+            logging.info(f"EMA enabled with decay={ema_decay}")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -550,6 +602,10 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
+        # Update EMA shadow parameters after optimizer step
+        if self.ema is not None:
+            self.ema.update(self.model)
+
         return loss.item(), dig_losses, div_loss_tensor.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
@@ -557,8 +613,12 @@ class PCVRHyFormerRankingTrainer:
 
         NaN predictions (which can arise from exploding gradients) are filtered
         out before computing both metrics.
+        When EMA is enabled, validation is always run with EMA weights.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
+        # Swap in EMA weights for evaluation
+        if self.ema is not None:
+            self.ema.apply(self.model)
         self.model.eval()
         if not epoch:
             epoch = -1
@@ -602,6 +662,10 @@ class PCVRHyFormerRankingTrainer:
             logloss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels.float()).item()
         else:
             logloss = float('inf')
+
+        # Restore original weights after evaluation
+        if self.ema is not None:
+            self.ema.restore(self.model)
 
         return auc, logloss
 

@@ -228,6 +228,10 @@ def parse_args() -> argparse.Namespace:
                              'same sequence domain to prevent query collapse. '
                              '0 = disabled. Only effective when --num_queries > 1. '
                              'Typical value: 0.01.')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='Exponential Moving Average decay for model parameters. '
+                             'EMA weights are used exclusively for validation/inference. '
+                             '0 = disabled. Typical value: 0.999.')
 
     args = parser.parse_args()
 
@@ -390,6 +394,7 @@ def main() -> None:
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         query_div_weight=args.query_div_weight,
+        ema_decay=args.ema_decay,
     )
 
     trainer.train()
