@@ -568,32 +568,45 @@ class PCVRHyFormerRankingTrainer:
             # coarse steps the Q tokens are mostly zeroed-out, so pairwise
             # cosine similarity is spuriously high and would inject noisy
             # gradients into the query projection parameters.
+            #
+            # Memory-efficient gradient accumulation: each sub-step calls
+            # loss.backward() immediately so only ONE forward pass graph is
+            # live in GPU memory at a time (instead of K graphs all kept until
+            # the final backward).  Optimizer step is deferred to after the loop.
             K = self.model.dig_steps
             weight_sum = K * (K + 1) / 2  # sum of 1..K
-            loss_sum = torch.tensor(0.0, device=self.device)
             dig_losses = []
+            total_loss_val = 0.0
             for step_idx in range(K):
                 reveal_ratio = (step_idx + 1) / K
                 step_weight = (step_idx + 1) / weight_sum  # linearly increasing
                 logits, step_div_loss = self.model(model_input, reveal_ratio=reveal_ratio)
                 logits = logits.squeeze(-1)
                 step_loss = self._compute_loss(logits, label)
-                loss_sum = loss_sum + step_weight * step_loss
                 # Accumulate div_loss only from the last (full-feature) step
                 if step_idx == K - 1:
                     div_loss_tensor = step_div_loss
+                    if self.query_div_weight > 0:
+                        step_loss = step_loss + self.query_div_weight * step_div_loss
+                weighted = step_weight * step_loss
+                # backward immediately to free this step's activation graph;
+                # retain_graph=False (default) drops the graph right away.
+                weighted.backward()
+                total_loss_val += weighted.item()
                 dig_losses.append(step_loss.item())
-            loss = loss_sum  # already weighted, no need to divide by K
+            loss = total_loss_val  # scalar float, used only for logging
         else:
             logits, div_loss_tensor = self.model(model_input)  # (B, 1), scalar
             logits = logits.squeeze(-1)  # (B,)
             loss = self._compute_loss(logits, label)
 
-        # Add query diversity regularisation loss (method B)
-        if self.query_div_weight > 0:
-            loss = loss + self.query_div_weight * div_loss_tensor
+            # Add query diversity regularisation loss (method B)
+            if self.query_div_weight > 0:
+                loss = loss + self.query_div_weight * div_loss_tensor
 
-        loss.backward()
+            loss.backward()
+            loss = loss.item()
+
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
@@ -606,7 +619,8 @@ class PCVRHyFormerRankingTrainer:
         if self.ema is not None:
             self.ema.update(self.model)
 
-        return loss.item(), dig_losses, div_loss_tensor.item()
+        loss_val = loss if isinstance(loss, float) else loss.item()
+        return loss_val, dig_losses, div_loss_tensor.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
